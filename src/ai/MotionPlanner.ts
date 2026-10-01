@@ -41,24 +41,39 @@ export function motionAt(t: number, ins: AnimationInstruction, vis?: VisemeFrame
   }
 }
 
-/** Baile: el cuerpo se balancea desde la cintura (la base de la foto queda fija) y la cabeza cabecea al compás. */
+/** Baile: el cuerpo se balancea desde la cintura (la base de la foto queda fija) y la cabeza cabecea al compás. Cada frase de 8 tiempos usa una figura distinta. */
 export interface DanceSpec { bpm: number; offset: number; fps: number; energy: number[] }
 export interface BodyMotion { swayX: number; roll: number; squash: number; zoom: number; pulse: number }
+/** Figuras: sway = balanceo lateral, bob = rebote vertical, yaw = giro de cabeza, nod = cabeceo, roll = inclinación, lean = ladeo lento de 4 tiempos. */
+const MOVES = [
+  { sway: 1, bob: 0.6, yaw: 0.5, nod: 0.8, roll: 1, lean: 0 },      // balanceo clásico
+  { sway: 0.35, bob: 1, yaw: 0.25, nod: 1.1, roll: 0.4, lean: 0 },  // rebote
+  { sway: 0.7, bob: 0.5, yaw: 1, nod: 0.5, roll: 0.8, lean: 1 },    // mira a los lados y ladea
+  { sway: 0.55, bob: 0.8, yaw: 0.4, nod: 0.7, roll: 1.2, lean: 0 }  // balanceo amplio
+]
+type Move = (typeof MOVES)[number]
+const moveOf = (phrase: number): Move => MOVES[Math.imul(phrase + 7, 2654435761) >>> 30]
 /** t en segundos del vídeo; offset = instante del primer beat. */
 export function danceAt(t: number, d: DanceSpec): { face: FacialMotion; body: BodyMotion } {
   const b = (t - d.offset) / (60 / d.bpm), ph = b - Math.floor(b)
-  const e = d.energy.length ? d.energy[Math.min(d.energy.length - 1, Math.max(0, Math.round(t * d.fps)))] : 1, amp = 0.55 + 0.45 * e
-  const down = (0.5 + 0.5 * Math.cos(2 * Math.PI * ph)) ** 1.6   // 1 justo en el beat, 0 a contratiempo
-  const side = Math.cos(Math.PI * b)                              // +1 / -1 alternando en cada beat
-  const pulse = Math.exp(-4 * ph)                                 // destello al golpe
+  const e = d.energy.length ? d.energy[Math.min(d.energy.length - 1, Math.max(0, Math.round(t * d.fps)))] : 1
+  const amp = (0.4 + 0.6 * e) * Math.min(1, 120 / d.bpm) ** 0.6     // más suave con música floja y con tempos rápidos (menos tiempo para moverse)
+  const cosDown = (0.5 + 0.5 * Math.cos(2 * Math.PI * ph)) ** 1.6      // 1 justo en el beat, 0 a contratiempo (suave: tolera un BPM algo desajustado)
+  const sharp = Math.max(ss(0.8, 1, ph), Math.exp(-4 * ph) * (1 - ss(0.3, 0.6, ph)))  // anticipación corta + golpe seco en el beat + caída rápida
+  const hit = 0.65 * cosDown + 0.35 * sharp
+  const side = Math.cos(Math.PI * b)                                    // +1 / -1 alternando en cada beat
+  const slow = Math.sin((Math.PI * b) / 2)                              // ciclo de 4 tiempos
+  const pulse = Math.exp(-4 * ph)                                       // destello al golpe
+  const q = b / 8, k = Math.floor(q), mix = ss(0.875, 1, q - k), A = moveOf(k), B = moveOf(k + 1)  // figura de la frase, fundida con la siguiente en el último tiempo
+  const P = { sway: A.sway + (B.sway - A.sway) * mix, bob: A.bob + (B.bob - A.bob) * mix, yaw: A.yaw + (B.yaw - A.yaw) * mix, nod: A.nod + (B.nod - A.nod) * mix, roll: A.roll + (B.roll - A.roll) * mix, lean: A.lean + (B.lean - A.lean) * mix }
   const bl = (x: number) => ss(0, 0.07, x) * (1 - ss(0.09, 0.18, x))
   const blink = Math.max(bl((t + 0.9) % 3.3), bl((t + 2.1) % 5.7))
   return {
     face: {
       eyeBlinkLeft: blink, eyeBlinkRight: blink, eyeLookX: 0.02 * Math.sin(t * 3.1), eyeLookY: 0.02 * Math.sin(t * 2.3 + 1),
-      mouthSmile: 0.5 + 0.25 * down * amp, mouthOpen: 0.1 * down * amp, eyebrowLeft: 0.15 + 0.15 * down, eyebrowRight: 0.15 + 0.15 * down,
-      headYaw: 0.5 * amp * Math.sin((Math.PI * b) / 2), headPitch: 0.9 * amp * down, headRoll: -0.1 * amp * side, mouthWidth: 0.55, lipRound: 0
+      mouthSmile: 0.5 + 0.25 * hit * amp, mouthOpen: 0.1 * hit * amp, eyebrowLeft: 0.15 + 0.15 * hit, eyebrowRight: 0.15 + 0.15 * hit,
+      headYaw: 0.7 * amp * P.yaw * slow, headPitch: 0.9 * amp * P.nod * hit, headRoll: -0.1 * amp * P.roll * side - 0.05 * amp * P.lean * slow, mouthWidth: 0.55, lipRound: 0
     },
-    body: { swayX: side * amp, roll: 0.035 * amp * side, squash: 1 - 0.045 * amp * down, zoom: 1.05, pulse }
+    body: { swayX: side * amp * P.sway, roll: 0.035 * amp * P.roll * side + 0.03 * amp * P.lean * slow, squash: 1 - 0.05 * amp * P.bob * hit, zoom: 1.05 + 0.01 * amp * hit, pulse }
   }
 }
