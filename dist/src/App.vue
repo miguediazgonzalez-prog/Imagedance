@@ -13,9 +13,11 @@ import { segmentPerson, type Mask } from './ai/Segmenter'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
 const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
-const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string } | null>(null)
+const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string } | null>(null)
 const recording = ref(false), voiceBuf = ref<AudioBuffer | null>(null), voiceUrl = ref(''), speechText = ref(''), hasAudio = ref(false)
 let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudioElement | null = null
+const BUILD = 'audio-diag-2', diag = ref('')
+let diagBase = ''
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
 const debug = new URLSearchParams(location.search).has('debug')
 // Baile con música + fondo
@@ -73,12 +75,16 @@ async function toggleRec() {
 }
 function clearVoice() { voiceBuf.value = null; if (voiceUrl.value) URL.revokeObjectURL(voiceUrl.value); voiceUrl.value = ''; aud = null }
 function onPlay(e: Event) {
-  if (hasAudio.value) return
+  if (hasAudio.value) {
+    const v = e.target as HTMLVideoElement
+    setTimeout(() => { const a = v as any; diag.value = `${diagBase} · reproducción: muted=${v.muted} vol=${v.volume} pistas=${a.audioTracks?.length ?? '?'} bytesAudio=${a.webkitAudioDecodedByteCount ?? '?'}` }, 1500)
+    return
+  }
   if (playUrl.value) { aud ??= new Audio(playUrl.value); aud.currentTime = (e.target as HTMLVideoElement).currentTime + playFrom; aud.play() }
   else if (speechText.value) setTimeout(() => speakPreview(speechText.value), 500)
 }
 function onPause() { aud?.pause(); if ('speechSynthesis' in window) speechSynthesis.cancel() }
-function clear(all = true) { if (videoUrl.value) URL.revokeObjectURL(videoUrl.value); videoUrl.value = ''; out.value = null; pct.value = 0; if (all) { if (photoUrl.value) URL.revokeObjectURL(photoUrl.value); photoUrl.value = ''; bitmap.value = null; status.value = '' } }
+function clear(all = true) { diag.value = ''; if (videoUrl.value) URL.revokeObjectURL(videoUrl.value); videoUrl.value = ''; out.value = null; pct.value = 0; if (all) { if (photoUrl.value) URL.revokeObjectURL(photoUrl.value); photoUrl.value = ''; bitmap.value = null; status.value = '' } }
 async function generate() {
   const bm = bitmap.value; if (!bm || busy.value) return
   if (dance.value && !musicBuf) { status.value = 'Sube primero la música con la que quieres que baile.'; return }
@@ -116,7 +122,8 @@ async function generate() {
     const res = await renderVideo(job, p => (pct.value = Math.round(p * 100)))
     out.value = res.out; mode.value = `En uso: detector ${getDelegate()} · render ${res.where === 'worker' ? 'en worker' : 'en hilo principal'} · ${res.out.ext.toUpperCase()}`
     modelStatus().then(v => (modelMb.value = v))
-    hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); const why = out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : ''
+    hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); diagBase = `build ${BUILD} · ${out.value.audioInfo ? 'audio ' + out.value.audioInfo : 'audio: no codificado'}`; diag.value = diagBase
+    const why = out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : ''
     status.value = dance.value ? (hasAudio.value ? `Listo: baila a ${bpm.value} BPM con tu música.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : buf ? (hasAudio.value ? 'Listo, con tu voz.' : 'Listo. Este dispositivo no mezcla audio en el vídeo: tu voz suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : ins.speech ? 'Listo. La voz del texto solo suena en la vista previa (el navegador no deja capturarla): el archivo sale sin audio. Para llevar voz en el archivo, graba la tuya.' : 'Listo.'
@@ -169,6 +176,7 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     <button class="go" :disabled="!bitmap || busy || analyzing || !!(caps && !caps.ok)" @click="generate">{{ busy ? 'Animando…' : 'Animar' }}</button>
     <div v-if="busy" class="bar"><i :style="{ width: pct + '%' }" /></div>
     <div class="st" role="status">{{ status }}</div>
+    <div v-if="diag" class="st" style="font-size:.72rem;opacity:.75;word-break:break-all">{{ diag }}</div>
     <div v-if="videoUrl" class="row"><button :disabled="busy" @click="generate">Volver a generar</button><button @click="save">Guardar</button><button v-if="canShare" @click="share">Compartir</button></div>
     <DebugPanel v-if="debug && bitmap" :bitmap="bitmap" :crop="crop" :prompt="prompt" />
     <button class="lnk" @click="wipe">Borrar datos locales</button>
