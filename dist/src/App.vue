@@ -13,7 +13,7 @@ import { segmentPerson, type Mask } from './ai/Segmenter'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
 const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
-const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean } | null>(null)
+const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string } | null>(null)
 const recording = ref(false), voiceBuf = ref<AudioBuffer | null>(null), voiceUrl = ref(''), speechText = ref(''), hasAudio = ref(false)
 let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudioElement | null = null
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
@@ -116,9 +116,9 @@ async function generate() {
     const res = await renderVideo(job, p => (pct.value = Math.round(p * 100)))
     out.value = res.out; mode.value = `En uso: detector ${getDelegate()} · render ${res.where === 'worker' ? 'en worker' : 'en hilo principal'} · ${res.out.ext.toUpperCase()}`
     modelStatus().then(v => (modelMb.value = v))
-    hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob)
-    status.value = dance.value ? (hasAudio.value ? `Listo: baila a ${bpm.value} BPM con tu música.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.')
-      : buf ? (hasAudio.value ? 'Listo, con tu voz.' : 'Listo. Este dispositivo no mezcla audio en el vídeo: tu voz suena aparte en la vista previa y el archivo sale sin audio.')
+    hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); const why = out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : ''
+    status.value = dance.value ? (hasAudio.value ? `Listo: baila a ${bpm.value} BPM con tu música.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
+      : buf ? (hasAudio.value ? 'Listo, con tu voz.' : 'Listo. Este dispositivo no mezcla audio en el vídeo: tu voz suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : ins.speech ? 'Listo. La voz del texto solo suena en la vista previa (el navegador no deja capturarla): el archivo sale sin audio. Para llevar voz en el archivo, graba la tuya.' : 'Listo.'
   } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { busy.value = false }
 }
