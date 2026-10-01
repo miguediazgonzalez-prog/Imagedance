@@ -1,0 +1,15 @@
+/** Trabajo de render compartido: lo ejecuta el Worker (OffscreenCanvas) o, como respaldo, el hilo principal. */
+import type { Pt } from '../ai/FaceLandmarks'
+import type { Mask } from '../ai/Segmenter'
+import { motionAt, danceAt, type AnimationInstruction, type VisemeFrame, type DanceSpec } from '../ai/MotionPlanner'
+import { WarpRenderer } from './WarpRenderer'
+import type { BgSpec } from './Backgrounds'
+import { encodeVideo } from './VideoEncoder'
+export interface RenderJob { src: ImageBitmap; lm: Pt[]; ins: AnimationInstruction; vis?: VisemeFrame[]; dur: number; fps: number; audio?: { mono: Float32Array; sampleRate: number }; dance?: DanceSpec; bg?: BgSpec; mask?: Mask }
+export function runJob(j: RenderJob, canvas: HTMLCanvasElement | OffscreenCanvas, onProgress: (p: number) => void) {
+  const r = new WarpRenderer(canvas, j.src, j.lm, j.bg, j.mask)
+  return encodeVideo(canvas, Math.round(j.dur * j.fps), j.fps, i => {
+    const t = i / j.fps
+    if (j.dance) { const d = danceAt(t, j.dance); r.render(d.face, t, d.body) } else r.render(motionAt(t, j.ins, j.vis), t)
+  }, onProgress, j.audio)
+}
