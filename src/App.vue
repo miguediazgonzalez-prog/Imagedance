@@ -151,7 +151,7 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <div class="row"><button :disabled="busy" @click="toggleRec">{{ recording ? '⏹ Parar' : '🎙 Grabar mi voz' }}</button><button v-if="voiceBuf" @click="clearVoice">Quitar voz</button></div>
     </template>
     <template v-else>
-      <div class="row"><label class="btn">{{ musicName ? '🎵 Cambiar música' : '🎵 Subir música' }}<input type="file" accept="audio/*" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
+      <div class="row"><label class="btn">{{ musicName ? '🎵 Cambiar música' : '🎵 Subir música' }}<input type="file" accept="audio/*,audio/mpeg,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
       <div v-if="musicName" class="music">
         <div class="st">🎵 {{ musicName }} · {{ musicDur.toFixed(0) }} s</div>
         <div class="row bpmrow"><button @click="setBpm(bpm / 2)">÷2</button><button @click="setBpm(bpm - 1)">−</button><b>{{ bpm }} BPM</b><button @click="setBpm(bpm + 1)">+</button><button @click="setBpm(bpm * 2)">×2</button></div>
