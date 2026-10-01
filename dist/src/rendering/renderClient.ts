@@ -1,6 +1,6 @@
 /** Lanza el render en un Worker; si el navegador no soporta WebGL2 en OffscreenCanvas, cae al hilo principal (cediendo entre frames). */
 import { runJob, type RenderJob } from './renderJob'
-type Out = { blob: Blob; ext: string; audio: boolean; audioNote?: string }
+type Out = { blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string }
 export async function renderVideo(job: RenderJob, onProgress: (p: number) => void): Promise<{ out: Out; where: 'worker' | 'main' }> {
   if (typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined') {
     try {
