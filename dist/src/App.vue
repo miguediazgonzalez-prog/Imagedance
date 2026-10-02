@@ -9,6 +9,7 @@ import { parseInstruction, type VisemeFrame, type DanceSpec } from './ai/MotionP
 import { startRecording, decodeAudio, audioVisemes, textVisemes, speakPreview, toMono } from './audio/SpeechEngine'
 import { renderVideo } from './rendering/renderClient'
 import { analyzeTempo, beatOffset, energyFrames, type Tempo } from './audio/BeatDetector'
+import { TRACKS, trackUrl, type Track } from './audio/Tracks'
 import { segmentPerson, type Mask } from './ai/Segmenter'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
 const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
@@ -16,30 +17,40 @@ const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string } | null>(null)
 const recording = ref(false), voiceBuf = ref<AudioBuffer | null>(null), voiceUrl = ref(''), speechText = ref(''), hasAudio = ref(false)
 let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudioElement | null = null
-const BUILD = 'audio-diag-3', diag = ref('')
+const BUILD = 'audio-diag-4', diag = ref('')
 let diagBase = ''
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
 const debug = new URLSearchParams(location.search).has('debug')
 // Baile con música + fondo
-const dance = ref(false), analyzing = ref(false), musicName = ref(''), musicUrl = ref(''), musicDur = ref(0), bpm = ref(0), startAt = ref(0)
+const dance = ref(true), selTrack = ref(''), analyzing = ref(false), musicName = ref(''), musicUrl = ref(''), musicDur = ref(0), bpm = ref(0), startAt = ref(0)
 const bgId = ref<BgId | 'none'>('none'), bgBmp = ref<ImageBitmap | null>(null), lastDance = ref(false), playUrl = ref('')
-let musicBuf: AudioBuffer | null = null, musicMono: Float32Array | null = null, tempo: Tempo | null = null, playFrom = 0
+let musicBuf: AudioBuffer | null = null, musicMono: Float32Array | null = null, tempo: Tempo | null = null, playFrom = 0, gridOrigin: number | null = null  // gridOrigin: instante de un beat conocido (canciones incluidas); null = hay que detectarlo
 const danceMax = computed(() => tiers[tier.value].dd)
 const maxStart = computed(() => Math.max(0, musicDur.value - Math.min(danceMax.value, musicDur.value)))
 const danceDur = computed(() => Math.max(1, Math.min(danceMax.value, musicDur.value - startAt.value)))
 watch([tier, musicDur], () => { startAt.value = Math.min(startAt.value, maxStart.value) })
 const tierLabel = (k: keyof typeof tiers) => (dance.value ? `${tiers[k].label.split(' · ').slice(0, 2).join(' · ')} · hasta ${tiers[k].dd} s` : tiers[k].label)
 const setBpm = (v: number) => (bpm.value = Math.min(240, Math.max(40, Math.round(v * 10) / 10)))
-function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null }
+function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null }
+/** Carga una canción (subida o incluida), la analiza y deja lista la edición. `known` = BPM exacto de las incluidas; `auto` = carga silenciosa al abrir la app. */
+async function loadMusic(blob: Blob, name: string, known?: number, trackId = '', auto = false) {
+  analyzing.value = true; clear(false); clearMusic(); if (!auto) status.value = 'Leyendo el audio…'
+  try {
+    const buf = await decodeAudio(blob); if (!auto) status.value = 'Calculando el ritmo…'; await new Promise(r => setTimeout(r, 30))
+    musicBuf = buf; musicMono = toMono(buf); tempo = analyzeTempo(musicMono, buf.sampleRate); gridOrigin = known ? 0 : null
+    musicUrl.value = URL.createObjectURL(blob); musicName.value = name; selTrack.value = trackId; musicDur.value = buf.duration; bpm.value = known ?? tempo.bpm
+    if (!auto) status.value = known ? `${name}: ${known} BPM. Elige fondo, foto y pulsa Animar.` : tempo.conf < 0.08 ? 'No noto un pulso claro en este audio. Ajusta el BPM a mano si hace falta.' : `Ritmo detectado: ${tempo.bpm} BPM. Si baila a media velocidad o al doble, usa ÷2 / ×2.`
+  } catch { clearMusic(); if (!auto) status.value = 'No pude leer ese audio. Prueba con MP3, M4A, WAV u OGG.' } finally { analyzing.value = false }
+}
 async function pickMusic(e: Event) {
   const input = e.target as HTMLInputElement, f = input.files?.[0]; input.value = ''; if (!f) return
-  analyzing.value = true; clear(false); clearMusic(); status.value = 'Leyendo el audio…'
-  try {
-    const buf = await decodeAudio(f); status.value = 'Calculando el ritmo…'; await new Promise(r => setTimeout(r, 30))
-    musicBuf = buf; musicMono = toMono(buf); tempo = analyzeTempo(musicMono, buf.sampleRate)
-    musicUrl.value = URL.createObjectURL(f); musicName.value = f.name; musicDur.value = buf.duration; bpm.value = tempo.bpm
-    status.value = tempo.conf < 0.08 ? 'No noto un pulso claro en este audio. Ajusta el BPM a mano si hace falta.' : `Ritmo detectado: ${tempo.bpm} BPM. Si baila a media velocidad o al doble, usa ÷2 / ×2.`
-  } catch { clearMusic(); status.value = 'No pude leer ese audio. Prueba con MP3, M4A, WAV u OGG.' } finally { analyzing.value = false }
+  await loadMusic(f, f.name)
+}
+async function pickTrack(t: Track, auto = false) {
+  if (busy.value || analyzing.value) return
+  analyzing.value = true; if (!auto) status.value = `Cargando ${t.name}…`
+  try { const r = await fetch(trackUrl(t)); if (!r.ok) throw new Error(String(r.status)); await loadMusic(await r.blob(), t.name, t.bpm, t.id, auto) }
+  catch { analyzing.value = false; if (!auto) status.value = 'No pude cargar esa canción (¿sin conexión?). Prueba otra o sube la tuya.' }
 }
 async function pickBg(e: Event) {
   const input = e.target as HTMLInputElement, f = input.files?.[0]; input.value = ''; if (!f) return
@@ -48,7 +59,7 @@ async function pickBg(e: Event) {
 const caps = ref<Caps | null>(null), modelMb = ref<number | null>(null), mode = ref('')
 const capsLine = computed(() => { const c = caps.value; return c ? `Modo recomendado: ${tiers[c.tier].label}. ${c.cores} núcleos${c.memory ? ` · ~${c.memory} GB` : ''} · WebGPU ${c.webgpu ? 'disponible' : 'no disponible'} · SIMD ${c.simd ? 'sí' : 'no'}` : '' })
 const modelLine = computed(() => (modelMb.value ? `Modelo descargado: ${modelMb.value.toFixed(0)} MB · disponible offline` : 'El modelo facial se descargará la primera vez.'))
-onMounted(() => { detectCaps().then(c => { caps.value = c; tier.value = c.tier; if (!c.ok) status.value = c.problems.join(' ') }); modelStatus().then(v => (modelMb.value = v)) })
+onMounted(() => { if (dance.value) pickTrack(TRACKS[0], true); detectCaps().then(c => { caps.value = c; tier.value = c.tier; if (!c.ok) status.value = c.problems.join(' ') }); modelStatus().then(v => (modelMb.value = v)) })
 async function wipe() { if (!confirm('Se borrará el modelo descargado y la foto actual. ¿Continuar?')) return; clear(); clearVoice(); clearMusic(); bgBmp.value = null; bgId.value = 'none'; await clearLocalData(); modelMb.value = null; mode.value = ''; status.value = 'Datos locales borrados.' }
 const crop = reactive({ zoom: 1, cx: 0, cy: 0, rot: 0 }), cv = ref<HTMLCanvasElement | null>(null)
 const pts = new Map<number, { x: number; y: number }>(); let pinch0 = 1, zoom0 = 1
@@ -105,7 +116,7 @@ async function generate() {
     speechText.value = ''
     if (dance.value) {
       const sr = musicBuf!.sampleRate, frames = Math.floor(danceDur.value * T.fps), dur = frames / T.fps, t0 = startAt.value
-      const spec: DanceSpec = { bpm: bpm.value, offset: beatOffset(tempo!, bpm.value, t0, t0 + dur), fps: T.fps, energy: energyFrames(musicMono!, sr, T.fps, t0, frames) }
+      const per = 60 / bpm.value, spec: DanceSpec = { bpm: bpm.value, offset: gridOrigin !== null ? (((gridOrigin - t0) % per) + per) % per : beatOffset(tempo!, bpm.value, t0, t0 + dur), fps: T.fps, energy: energyFrames(musicMono!, sr, T.fps, t0, frames) }
       ins = { duration: dur, eyeMovement: 'camera', intensity: 0.65 }
       job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, bg, mask }
       playUrl.value = musicUrl.value; playFrom = t0; aud = null
@@ -152,14 +163,16 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <button v-if="videoUrl" @click="clear(false)">Ajustar encuadre</button>
     </div>
     <div v-if="bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop)">↻ Girar</button></div>
-    <div class="row seg"><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button></div>
+    <div class="row seg"><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button></div>
     <template v-if="!dance">
       <label>¿Qué quieres que haga?
         <textarea v-model="prompt" placeholder="Que sonría, mire a la cámara y parpadee…" style="width:100%" /></label>
       <div class="row"><button :disabled="busy" @click="toggleRec">{{ recording ? '⏹ Parar' : '🎙 Grabar mi voz' }}</button><button v-if="voiceBuf" @click="clearVoice">Quitar voz</button></div>
     </template>
     <template v-else>
-      <div class="row"><label class="btn">{{ musicName ? '🎵 Cambiar música' : '🎵 Subir música' }}<input type="file" accept="audio/*,audio/mpeg,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
+      <div class="bgs"><div class="st">Música incluida</div>
+        <div class="chips"><button v-for="t in TRACKS" :key="t.id" :class="{ on: selTrack === t.id }" :disabled="busy || analyzing" @click="pickTrack(t)">{{ t.emoji }} {{ t.name }}</button></div></div>
+      <div class="row"><label class="btn">{{ musicName && !selTrack ? '🎵 Cambiar la mía' : '🎵 Subir la mía' }}<input type="file" accept="audio/*,audio/mpeg,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
       <div v-if="musicName" class="music">
         <div class="st">🎵 {{ musicName }} · {{ musicDur.toFixed(0) }} s</div>
         <div class="row bpmrow"><button @click="setBpm(bpm / 2)">÷2</button><button @click="setBpm(bpm - 1)">−</button><b>{{ bpm }} BPM</b><button @click="setBpm(bpm + 1)">+</button><button @click="setBpm(bpm * 2)">×2</button></div>

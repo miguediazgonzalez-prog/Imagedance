@@ -1,6 +1,7 @@
 /** Ritmo: BPM (autocorrelación del onset + ajuste fino por peine), fase de los beats en un fragmento y energía por fotograma. Sin DOM: se puede probar en Node. */
-export interface Tempo { bpm: number; conf: number; env: Float32Array; rate: number }
-const RATE = 200, MIN_BPM = 55, MAX_BPM = 200, MAX_SECS = 150
+/** env = golpes de todo el espectro (para el BPM); pe = lo mismo pero con los graves (bombo) mandando, para saber en qué instante cae el beat. */
+export interface Tempo { bpm: number; conf: number; env: Float32Array; pe: Float32Array; rate: number }
+const RATE = 200, MIN_BPM = 55, MAX_BPM = 200, MAX_SECS = 480
 
 /** Gaussiana suave (σ en muestras) con bordes reflejados. */
 function blur(a: Float32Array, sigma: number): Float32Array {
@@ -14,7 +15,7 @@ function blur(a: Float32Array, sigma: number): Float32Array {
 const at = (a: Float32Array, p: number) => { const i = Math.floor(p); if (i < 0 || i >= a.length - 1) return 0; const f = p - i; return a[i] * (1 - f) + a[i + 1] * f }
 
 /** Curva de "golpes" (onsets): flujo positivo del log-energía en graves y en agudos, ~200 valores/s. */
-function onsetEnvelope(mono: Float32Array, sr: number): { env: Float32Array; rate: number } {
+function onsetEnvelope(mono: Float32Array, sr: number): { env: Float32Array; pe: Float32Array; rate: number } {
   const hop = Math.max(1, Math.round(sr / RATE)), rate = sr / hop, n = Math.floor(Math.min(mono.length, MAX_SECS * sr) / hop)
   const aLo = 1 - Math.exp((-2 * Math.PI * 150) / sr), aHi = 1 - Math.exp((-2 * Math.PI * 2000) / sr)
   const bands = [new Float32Array(n), new Float32Array(n)]; let lo = 0, hi = 0
@@ -23,17 +24,17 @@ function onsetEnvelope(mono: Float32Array, sr: number): { env: Float32Array; rat
     for (let i = f * hop; i < (f + 1) * hop; i++) { const x = mono[i]; lo += aLo * (x - lo); hi += aHi * (x - hi); const h = x - hi; eLo += lo * lo; eHi += h * h }
     bands[0][f] = Math.log(1 + 300 * Math.sqrt(eLo / hop)); bands[1][f] = Math.log(1 + 300 * Math.sqrt(eHi / hop))
   }
-  const env = new Float32Array(n)
+  const env = new Float32Array(n), pe0 = new Float32Array(n)
   bands.forEach((b, bi) => {
     const s = blur(b, 1.5), d = new Float32Array(n); let m = 0
     for (let f = 1; f < n; f++) { d[f] = Math.max(0, s[f] - s[f - 1]); m += d[f] }
     m = m / Math.max(1, n) || 1e-9
-    for (let f = 0; f < n; f++) env[f] += (d[f] / m) * (bi ? 0.7 : 1)
+    for (let f = 0; f < n; f++) { env[f] += (d[f] / m) * (bi ? 0.7 : 1); pe0[f] += (d[f] / m) * (bi ? 0.3 : 1) }
   })
   // Quita la media local (~0.4 s) para quedarse solo con los picos.
-  const loc = blur(env, rate * 0.2), out = new Float32Array(n)
-  for (let f = 0; f < n; f++) out[f] = Math.max(0, env[f] - loc[f])
-  return { env: out, rate }
+  const loc = blur(env, rate * 0.2), out = new Float32Array(n), loc2 = blur(pe0, rate * 0.2), pe = new Float32Array(n)
+  for (let f = 0; f < n; f++) { out[f] = Math.max(0, env[f] - loc[f]); pe[f] = Math.max(0, pe0[f] - loc2[f]) }
+  return { env: out, pe, rate }
 }
 
 /** Puntuación de peine: media de la curva en los instantes fase + k·periodo, con la mejor fase. Devuelve [puntuación, fase en muestras]. */
@@ -48,8 +49,8 @@ function comb(env: Float32Array, period: number, from: number, to: number): [num
 }
 
 export function analyzeTempo(mono: Float32Array, sr: number): Tempo {
-  const { env, rate } = onsetEnvelope(mono, sr), n = env.length
-  if (n < rate * 4) return { bpm: 120, conf: 0, env, rate }
+  const { env, pe, rate } = onsetEnvelope(mono, sr), n = env.length
+  if (n < rate * 4) return { bpm: 120, conf: 0, env, pe, rate }
   const mean = env.reduce((a, b) => a + b, 0) / n, z = env.map(v => v - mean)
   const maxLag = Math.ceil((rate * 60) / MIN_BPM) * 4, acf = new Float32Array(maxLag + 1)
   for (let l = 0; l <= maxLag; l++) { let s = 0; for (let i = 0; i + l < n; i++) s += z[i] * z[i + l]; acf[l] = s / (n - l) }
@@ -65,12 +66,12 @@ export function analyzeTempo(mono: Float32Array, sr: number): Tempo {
   for (let b = bestB * 0.97; b <= bestB * 1.03; b += 0.05) { const s = comb(es, (rate * 60) / b, 0, n)[0]; if (s > fs) { fs = s; fb = b } }
   const r = Math.round(fb), bpm = Math.abs(fb - r) < 0.25 ? r : Math.round(fb * 10) / 10
   // Confianza: fuerza del pico de autocorrelación respecto a la varianza total (0 = sin pulso, ~0.3+ = ritmo marcado).
-  return { bpm, conf: Math.max(0, at(acf, (rate * 60) / bpm) / (acf[0] || 1)), env, rate }
+  return { bpm, conf: Math.max(0, at(acf, (rate * 60) / bpm) / (acf[0] || 1)), env, pe, rate }
 }
 
 /** Instante (s, relativo al inicio del fragmento) del primer beat dentro de [t0, t1] del audio, para el BPM dado. */
 export function beatOffset(t: Tempo, bpm: number, t0: number, t1: number): number {
-  const es = blur(t.env, 2), period = (t.rate * 60) / bpm
+  const es = blur(t.pe, 2), period = (t.rate * 60) / bpm
   const from = Math.max(0, Math.round(t0 * t.rate)), to = Math.min(es.length, Math.round(t1 * t.rate))
   if (to - from < period * 2) return 0
   return comb(es, period, from, to)[1] / t.rate

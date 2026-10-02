@@ -9,7 +9,8 @@ export default defineConfig({
     // El modelo y el WASM de MediaPipe se cachean tras la primera descarga => funciona offline.
     workbox: { globPatterns: ['**/*.{js,css,html,svg,png,wasm}'],
       runtimeCaching: [{ urlPattern: /^https:\/\/(cdn\.jsdelivr\.net|storage\.googleapis\.com)\//, handler: 'CacheFirst',
-        options: { cacheName: 'ai-models', cacheableResponse: { statuses: [0, 200] } } }] }
+        options: { cacheName: 'ai-models', cacheableResponse: { statuses: [0, 200] } } },
+      { urlPattern: /\/music\/[^/]+\.mp3$/, handler: 'CacheFirst', options: { cacheName: 'music', cacheableResponse: { statuses: [200] } } }] }
   })],
   build: { target: 'es2022' }
 })
