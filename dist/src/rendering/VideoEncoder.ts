@@ -37,7 +37,7 @@ async function attempt(canvas: Cv, frames: number, fps: number, draw: (i: number
   const muxer: any = mp4
     ? new Mp4Muxer({ target: target as Mp4Target, video: { codec: 'avc', width: w, height: h }, audio: au && { codec: 'aac', ...au }, fastStart: 'in-memory' })
     : new WebmMuxer({ target: target as WebmTarget, video: { codec: c.codec.startsWith('vp09') ? 'V_VP9' : 'V_VP8', width: w, height: h, frameRate: fps }, audio: au && { codec: 'A_OPUS', ...au } })
-  let err: unknown, vN = 0, aN = 0, cur = 0, key = true, aBytes = 0, adts = false, desc: number | null = null
+  let err: unknown, vN = 0, aN = 0, cur = 0, key = true, aBytes = 0, adts = false, desc: number | null = null, descHex = '', ascUsed = ''
   // Los muxers leen decoderConfig del primer chunk; si el navegador no lo entrega, fallan al final con "null is not an object".
   const put = (kind: 'v' | 'a', ch: any, m: any) => {
     try {
@@ -45,6 +45,17 @@ async function attempt(canvas: Cv, frames: number, fps: number, draw: (i: number
         aN++; aBytes += ch.byteLength; if (m?.decoderConfig?.description) desc = m.decoderConfig.description.byteLength
         // Si el navegador entrega AAC con cabecera ADTS (7/9 bytes) en vez de AAC crudo, se quita: el MP4 necesita muestras sin ADTS.
         if (mp4) { const d = new Uint8Array(ch.byteLength); ch.copyTo(d); if (d.length > 9 && d[0] === 0xff && (d[1] & 0xf0) === 0xf0) { adts = true; ch = new EncodedAudioChunk({ type: ch.type, timestamp: ch.timestamp, duration: ch.duration ?? undefined, data: d.subarray(d[1] & 1 ? 7 : 9) }) } }
+        // El muxer espera en `description` solo el AudioSpecificConfig (2-5 bytes). Safari entrega 39 bytes (un descriptor esds completo), lo que corrompe el esds del MP4 y iOS descarta la pista de audio.
+        // Se extrae el AudioSpecificConfig del descriptor; si no se puede, se descarta para que el muxer use el suyo (AAC-LC, mismos Hz y canales que pedimos al codificador).
+        if (mp4 && m?.decoderConfig?.description) {
+          const d0 = m.decoderConfig.description as ArrayBuffer | ArrayBufferView
+          const raw = d0 instanceof ArrayBuffer ? new Uint8Array(d0) : new Uint8Array(d0.buffer, d0.byteOffset, d0.byteLength)
+          if (!descHex) descHex = Array.from(raw.subarray(0, 48), (x) => x.toString(16).padStart(2, '0')).join('')
+          const asc = raw.length <= 5 ? raw : ascFromEsds(raw)
+          const { description: _drop, ...rest } = m.decoderConfig
+          m = { ...m, decoderConfig: asc ? { ...rest, description: asc.slice() } : rest }
+          ascUsed = asc ? asc.length + ' B' : 'del muxer'
+        }
         muxer.addAudioChunk(ch, m); return
       }
       vN++
@@ -78,7 +89,21 @@ async function attempt(canvas: Cv, frames: number, fps: number, draw: (i: number
     muxer.finalize()
   } finally { for (const e of [venc, aenc]) try { e?.close() } catch { /* ya cerrado */ } }
   return { blob: new Blob([(target as { buffer: ArrayBuffer }).buffer], { type: mp4 ? 'video/mp4' : 'video/webm' }), ext: mp4 ? 'mp4' : 'webm', audio: !!ac, audioNote: ac ? undefined : note,
-    audioInfo: ac && audio ? `${ac.codec} ${audio.sampleRate} Hz · ${aN} bloques · ${(aBytes / 1024).toFixed(0)} KB · pico de entrada ${peak(audio.mono).toFixed(2)} · description ${desc ?? 'no'}${adts ? ' · ADTS quitado' : ''}` : undefined }
+    audioInfo: ac && audio ? `${ac.codec} ${audio.sampleRate} Hz · ${aN} bloques · ${(aBytes / 1024).toFixed(0)} KB · pico de entrada ${peak(audio.mono).toFixed(2)} · description ${desc ?? 'no'}${ascUsed ? ' → ' + ascUsed : ''}${adts ? ' · ADTS quitado' : ''}${descHex ? ' · hex ' + descHex : ''}` : undefined }
 }
 
 function peak(a: Float32Array) { let m = 0; for (let i = 0; i < a.length; i++) { const v = Math.abs(a[i]); if (v > m) m = v } return m }
+
+/** Busca el DecoderSpecificInfo (tag 0x05) dentro de un ES_Descriptor MPEG-4 (tag 0x03 → 0x04 → 0x05) y devuelve su contenido (el AudioSpecificConfig). */
+function ascFromEsds(b: Uint8Array): Uint8Array | null {
+  let i = 0
+  const len = () => { let n = 0, k = 0, c: number; do { c = b[i++]; n = (n << 7) | (c & 0x7f); k++ } while (c & 0x80 && k < 4 && i < b.length); return n }
+  while (i < b.length) {
+    const tag = b[i++]; const n = len()
+    if (tag === 0x03) { i += 2; const f = b[i++]; if (f & 0x80) i += 2; if (f & 0x40) i += 1 + b[i]; if (f & 0x20) i += 2 }
+    else if (tag === 0x04) i += 13
+    else if (tag === 0x05) return n >= 2 && n <= 5 && i + n <= b.length ? b.subarray(i, i + n) : null
+    else i += n
+  }
+  return null
+}

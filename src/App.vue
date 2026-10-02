@@ -16,7 +16,7 @@ const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string } | null>(null)
 const recording = ref(false), voiceBuf = ref<AudioBuffer | null>(null), voiceUrl = ref(''), speechText = ref(''), hasAudio = ref(false)
 let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudioElement | null = null
-const BUILD = 'audio-diag-2', diag = ref('')
+const BUILD = 'audio-diag-3', diag = ref('')
 let diagBase = ''
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
 const debug = new URLSearchParams(location.search).has('debug')
@@ -77,6 +77,7 @@ function clearVoice() { voiceBuf.value = null; if (voiceUrl.value) URL.revokeObj
 function onPlay(e: Event) {
   if (hasAudio.value) {
     const v = e.target as HTMLVideoElement
+    v.muted = false
     setTimeout(() => { const a = v as any; diag.value = `${diagBase} · reproducción: muted=${v.muted} vol=${v.volume} pistas=${a.audioTracks?.length ?? '?'} bytesAudio=${a.webkitAudioDecodedByteCount ?? '?'}` }, 1500)
     return
   }
