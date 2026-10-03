@@ -90,16 +90,16 @@ const FN: Record<BgId, string> = {
 }
 /** Fragment shader completo del fondo elegido (uv con y hacia abajo, igual que la foto). */
 export const bgFragment = (id: BgId) => `#version 300 es
-precision highp float; in vec2 v; uniform float T; uniform float P; uniform sampler2D img; out vec4 o;
+precision highp float; in vec2 v; uniform float T; uniform float P; uniform sampler2D img; uniform float A; out vec4 o;
 float h21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(h21(i),h21(i+vec2(1.,0.)),f.x),mix(h21(i+vec2(0.,1.)),h21(i+vec2(1.,1.)),f.x),f.y); }
 float fbm(vec2 p){ float a=.5, s=0.; for(int k=0;k<5;k++){ s+=a*vn(p); p=p*2.03+vec2(1.7,9.2); a*=.5; } return s; }
 ${FN[id]}
-void main(){ o=vec4(clamp(bg(v),0.,1.),1.); }`
-/** Recorta la imagen elegida a un cuadrado S×S (modo «cubrir») para usarla de fondo. */
-export async function coverBitmap(src: ImageBitmap, S: number): Promise<ImageBitmap> {
-  const c = document.createElement('canvas'); c.width = c.height = S
-  const k = Math.max(S / src.width, S / src.height), w = src.width * k, h = src.height * k
-  c.getContext('2d')!.drawImage(src, (S - w) / 2, (S - h) / 2, w, h)
+void main(){ o=vec4(clamp(bg(vec2((v.x-.5)*A+.5,v.y)),0.,1.),1.); }`  // A = ancho/alto: en lienzos no cuadrados se ve la franja central, sin deformar
+/** Recorta la imagen elegida a W×H (modo «cubrir»; H = W si es cuadrada) para usarla de fondo. */
+export async function coverBitmap(src: ImageBitmap, W: number, H = W): Promise<ImageBitmap> {
+  const c = document.createElement('canvas'); c.width = W; c.height = H
+  const k = Math.max(W / src.width, H / src.height), w = src.width * k, h = src.height * k
+  c.getContext('2d')!.drawImage(src, (W - w) / 2, (H - h) / 2, w, h)
   return createImageBitmap(c)
 }

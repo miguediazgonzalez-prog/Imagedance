@@ -9,5 +9,5 @@ button,.btn{font-weight:600;text-align:center;cursor:pointer}button.go{backgroun
 button:disabled{opacity:.45}textarea{min-height:88px;resize:vertical}.row{display:flex;gap:8px}.row>*{flex:1}
 .bar{height:10px;border-radius:6px;background:#fff;overflow:hidden;box-shadow:0 0 0 2px var(--ink)}.bar i{display:block;height:100%;background:var(--acc)}
 .st{font-size:.9rem;color:var(--mut);min-height:1.2em}:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
-.frame canvas{width:100%;height:100%;touch-action:none;cursor:grab}input[type=range]{accent-color:var(--acc)}
+.frame canvas{width:100%;height:100%;touch-action:none;cursor:grab}.frame canvas.pv{touch-action:auto;cursor:default}input[type=range]{accent-color:var(--acc)}
 .lnk{border:0;background:none;text-decoration:underline;color:var(--mut);font-weight:400}

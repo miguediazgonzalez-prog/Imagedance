@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, reactive, watch, computed, onMounted } from 'vue'
+import { ref, reactive, watch, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { detectCaps, type Caps } from './ai/Capabilities'
 import DebugPanel from './components/DebugPanel.vue'
 import { modelStatus, clearLocalData } from './ai/ModelManager'
 import { clampCrop, resetCrop, rotateCrop, drawCrop, sideOf } from './components/cropper'
-import { detect, getDelegate } from './ai/FaceLandmarks'
+import { detect, getDelegate, type Pt } from './ai/FaceLandmarks'
 import { parseInstruction, type VisemeFrame, type DanceSpec } from './ai/MotionPlanner'
 import { startRecording, decodeAudio, audioVisemes, textVisemes, speakPreview, toMono } from './audio/SpeechEngine'
 import { renderVideo } from './rendering/renderClient'
@@ -12,6 +12,7 @@ import { analyzeTempo, beatOffset, energyFrames, type Tempo } from './audio/Beat
 import { TRACKS, trackUrl, type Track } from './audio/Tracks'
 import { segmentPerson, type Mask } from './ai/Segmenter'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
+import { Preview, unlockAudio } from './rendering/Preview'
 const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string } | null>(null)
@@ -20,18 +21,28 @@ let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudi
 const BUILD = 'audio-diag-4', diag = ref('')
 let diagBase = ''
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
+// Vista previa en vivo: mismo renderizador que el export, a 512 px y ~30 fps
+const PV = 512, PV_FPS = 30, previewing = ref(false), pvBusy = ref(false), pvPlaying = ref(false), pvCv = ref<HTMLCanvasElement | null>(null)
+let pv: Preview | null = null, pvMask: Mask | undefined, pvSrc: HTMLCanvasElement | null = null, pvL: Pt[] | null = null, pvT = 0, pvA = false
 const debug = new URLSearchParams(location.search).has('debug')
 // Baile con música + fondo
 const dance = ref(true), selTrack = ref(''), analyzing = ref(false), musicName = ref(''), musicUrl = ref(''), musicDur = ref(0), bpm = ref(0), startAt = ref(0)
 const bgId = ref<BgId | 'none'>('none'), bgBmp = ref<ImageBitmap | null>(null), lastDance = ref(false), playUrl = ref('')
 let musicBuf: AudioBuffer | null = null, musicMono: Float32Array | null = null, tempo: Tempo | null = null, playFrom = 0, gridOrigin: number | null = null  // gridOrigin: instante de un beat conocido (canciones incluidas); null = hay que detectarlo
+let enKey = '', enVal: number[] = []
+const energyFor = (fps: number, t0: number, frames: number) => { const k = `${fps}|${t0}|${frames}`; if (k !== enKey) { enVal = energyFrames(musicMono!, musicBuf!.sampleRate, fps, t0, frames); enKey = k } return enVal }
+/** Coreografía del fragmento [t0, t0+dur] de la canción actual (la usan el export y la vista previa, así se ven idénticos). */
+function makeDance(fps: number, t0: number, dur: number, frames: number): DanceSpec {
+  const per = 60 / bpm.value
+  return { bpm: bpm.value, offset: gridOrigin !== null ? (((gridOrigin - t0) % per) + per) % per : beatOffset(tempo!, bpm.value, t0, t0 + dur), fps, energy: energyFor(fps, t0, frames) }
+}
 const danceMax = computed(() => tiers[tier.value].dd)
 const maxStart = computed(() => Math.max(0, musicDur.value - Math.min(danceMax.value, musicDur.value)))
 const danceDur = computed(() => Math.max(1, Math.min(danceMax.value, musicDur.value - startAt.value)))
 watch([tier, musicDur], () => { startAt.value = Math.min(startAt.value, maxStart.value) })
 const tierLabel = (k: keyof typeof tiers) => (dance.value ? `${tiers[k].label.split(' · ').slice(0, 2).join(' · ')} · hasta ${tiers[k].dd} s` : tiers[k].label)
 const setBpm = (v: number) => (bpm.value = Math.min(240, Math.max(40, Math.round(v * 10) / 10)))
-function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null }
+function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null; enKey = '' }
 /** Carga una canción (subida o incluida), la analiza y deja lista la edición. `known` = BPM exacto de las incluidas; `auto` = carga silenciosa al abrir la app. */
 async function loadMusic(blob: Blob, name: string, known?: number, trackId = '', auto = false) {
   analyzing.value = true; clear(false); clearMusic(); if (!auto) status.value = 'Leyendo el audio…'
@@ -40,6 +51,7 @@ async function loadMusic(blob: Blob, name: string, known?: number, trackId = '',
     musicBuf = buf; musicMono = toMono(buf); tempo = analyzeTempo(musicMono, buf.sampleRate); gridOrigin = known ? 0 : null
     musicUrl.value = URL.createObjectURL(blob); musicName.value = name; selTrack.value = trackId; musicDur.value = buf.duration; bpm.value = known ?? tempo.bpm
     if (!auto) status.value = known ? `${name}: ${known} BPM. Elige fondo, foto y pulsa Animar.` : tempo.conf < 0.08 ? 'No noto un pulso claro en este audio. Ajusta el BPM a mano si hace falta.' : `Ritmo detectado: ${tempo.bpm} BPM. Si baila a media velocidad o al doble, usa ÷2 / ×2.`
+    pvLater(true)
   } catch { clearMusic(); if (!auto) status.value = 'No pude leer ese audio. Prueba con MP3, M4A, WAV u OGG.' } finally { analyzing.value = false }
 }
 async function pickMusic(e: Event) {
@@ -72,10 +84,10 @@ function move(e: PointerEvent) {
   if (pts.size === 2) crop.zoom = (zoom0 * gap()) / pinch0
 }
 const up = (e: PointerEvent) => { pts.delete(e.pointerId) }
-watch(() => [crop.zoom, crop.cx, crop.cy, crop.rot, bitmap.value, videoUrl.value], () => { const bm = bitmap.value; if (!bm) return; clampCrop(bm, crop); if (cv.value) drawCrop(bm, crop, 512, cv.value) }, { flush: 'post' })
+watch(() => [crop.zoom, crop.cx, crop.cy, crop.rot, bitmap.value, videoUrl.value, previewing.value], () => { const bm = bitmap.value; if (!bm) return; clampCrop(bm, crop); if (cv.value) drawCrop(bm, crop, 512, cv.value) }, { flush: 'post' })
 async function pick(e: Event) {
   const f = (e.target as HTMLInputElement).files?.[0]; if (!f) return
-  try { bitmap.value = await createImageBitmap(f); clear(false); resetCrop(bitmap.value, crop); photoUrl.value = URL.createObjectURL(f); status.value = '' }
+  try { bitmap.value = await createImageBitmap(f); stopPreview(); clear(false); resetCrop(bitmap.value, crop); photoUrl.value = URL.createObjectURL(f); status.value = '' }
   catch { status.value = 'Este navegador no puede abrir ese formato (¿HEIC?). Prueba con JPG, PNG o WebP.' }
 }
 async function toggleRec() {
@@ -96,12 +108,12 @@ function onPlay(e: Event) {
   else if (speechText.value) setTimeout(() => speakPreview(speechText.value), 500)
 }
 function onPause() { aud?.pause(); if ('speechSynthesis' in window) speechSynthesis.cancel() }
-function clear(all = true) { diag.value = ''; if (videoUrl.value) URL.revokeObjectURL(videoUrl.value); videoUrl.value = ''; out.value = null; pct.value = 0; if (all) { if (photoUrl.value) URL.revokeObjectURL(photoUrl.value); photoUrl.value = ''; bitmap.value = null; status.value = '' } }
+function clear(all = true) { diag.value = ''; if (videoUrl.value) URL.revokeObjectURL(videoUrl.value); videoUrl.value = ''; out.value = null; pct.value = 0; if (all) { stopPreview(); if (photoUrl.value) URL.revokeObjectURL(photoUrl.value); photoUrl.value = ''; bitmap.value = null; status.value = '' } }
 async function generate() {
   const bm = bitmap.value; if (!bm || busy.value) return
   if (dance.value && !musicBuf) { status.value = 'Sube primero la música con la que quieres que baile.'; return }
   if (bgId.value === 'image' && !bgBmp.value) { status.value = 'Elige una imagen para el fondo o selecciona otro fondo.'; return }
-  busy.value = true; clear(false)
+  busy.value = true; stopPreview(); clear(false)
   try {
     const T = tiers[tier.value], src = drawCrop(bm, crop, T.s)
     status.value = 'Analizando rostro…'; await new Promise(r => setTimeout(r, 30))
@@ -116,7 +128,7 @@ async function generate() {
     speechText.value = ''
     if (dance.value) {
       const sr = musicBuf!.sampleRate, frames = Math.floor(danceDur.value * T.fps), dur = frames / T.fps, t0 = startAt.value
-      const per = 60 / bpm.value, spec: DanceSpec = { bpm: bpm.value, offset: gridOrigin !== null ? (((gridOrigin - t0) % per) + per) % per : beatOffset(tempo!, bpm.value, t0, t0 + dur), fps: T.fps, energy: energyFrames(musicMono!, sr, T.fps, t0, frames) }
+      const spec = makeDance(T.fps, t0, dur, frames)
       ins = { duration: dur, eyeMovement: 'camera', intensity: 0.65 }
       job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, bg, mask }
       playUrl.value = musicUrl.value; playFrom = t0; aud = null
@@ -141,6 +153,48 @@ async function generate() {
       : ins.speech ? 'Listo. La voz del texto solo suena en la vista previa (el navegador no deja capturarla): el archivo sale sin audio. Para llevar voz en el archivo, graba la tuya.' : 'Listo.'
   } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { busy.value = false }
 }
+function pvSync(audio: boolean) {
+  if (!pv) return
+  if (!musicBuf || bpm.value <= 0) { pv.setClip(null, 0, 5); pv.setSpec(null); return }
+  const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
+  if (audio) pv.setClip(musicBuf, startAt.value, dur)
+  pv.setSpec(makeDance(PV_FPS, startAt.value, dur, frames))
+}
+/** Agrupa cambios seguidos (p. ej. al arrastrar el deslizador de inicio) para no reiniciar el sonido a cada pixel. */
+function pvLater(audio: boolean) { if (!pv) return; pvA ||= audio; clearTimeout(pvT); pvT = window.setTimeout(() => { const a = pvA; pvA = false; pvSync(a) }, 120) }
+/** Aplica el fondo elegido; la máscara de persona se calcula solo la primera vez que hace falta. */
+async function pvBg() {
+  if (!pv) return
+  try {
+    if (bgId.value !== 'none' && !pvMask) { status.value = 'Separando a la persona del fondo… (la primera vez se descarga el modelo)'; await new Promise(r => setTimeout(r, 30)); pvMask = await segmentPerson(pvSrc!, pvL![1]); status.value = '' }
+    if (!pv) return
+    const id = bgId.value
+    if (id === 'none') pv.setBackground(undefined)
+    else if (id === 'image') { if (bgBmp.value) pv.setBackground({ id, bitmap: await coverBitmap(bgBmp.value, PV) }, pvMask) }
+    else pv.setBackground({ id }, pvMask)
+  } catch (e) { status.value = e instanceof Error ? e.message : String(e); if (bgId.value !== 'none') bgId.value = 'none' }
+}
+async function startPreview() {
+  const bm = bitmap.value; if (!bm || busy.value || pvBusy.value || previewing.value) return
+  unlockAudio()   // dentro del toque: luego no se podría arrancar el audio en iOS
+  pvBusy.value = true
+  try {
+    status.value = 'Analizando rostro…'; await new Promise(r => setTimeout(r, 30))
+    const src = drawCrop(bm, crop, PV), L = await detect(src); if (!L) throw new Error('No detecto ningún rostro. Usa una foto frontal y bien iluminada.')
+    pvSrc = src; pvL = L; pvMask = undefined; previewing.value = true; await nextTick()
+    pv = new Preview(pvCv.value!, await createImageBitmap(src), L)
+    pvSync(true); await pvBg()
+    if (pv) { pv.play(); pvPlaying.value = true; status.value = 'Vista previa en vivo: cambia fondo, canción o BPM y se aplica al instante. Cuando te guste, pulsa Animar.' }
+  } catch (e) { stopPreview(); status.value = e instanceof Error ? e.message : String(e) } finally { pvBusy.value = false }
+}
+function stopPreview() { clearTimeout(pvT); pvA = false; pv?.dispose(); pv = null; pvMask = undefined; pvSrc = null; pvL = null; previewing.value = false; pvPlaying.value = false }
+const pvToggle = () => { pvPlaying.value = pv ? pv.toggle() : false }
+const onHide = () => { if (document.hidden && pv?.isPlaying) { pv.pause(); pvPlaying.value = false } }
+onMounted(() => document.addEventListener('visibilitychange', onHide))
+onBeforeUnmount(() => { document.removeEventListener('visibilitychange', onHide); stopPreview() })
+watch([bgId, bgBmp], () => { pvBg() })
+watch(startAt, () => pvLater(true)); watch(tier, () => pvLater(true)); watch(bpm, () => pvLater(false))
+watch(dance, v => { if (!v) stopPreview() })
 const fname = () => `foto-animada.${out.value!.ext}`
 function save() { const a = document.createElement('a'); a.href = videoUrl.value; a.download = fname(); a.click() }
 const share = () => navigator.share({ files: [new File([out.value!.blob], fname(), { type: out.value!.blob.type })] }).catch(() => {})
@@ -153,16 +207,21 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     <div class="badge">{{ modelLine }}</div>
     <div v-if="mode" class="badge">{{ mode }}</div>
     <div class="frame">
-      <video v-if="videoUrl" :src="videoUrl" controls playsinline :loop="lastDance ? hasAudio : !speechText && !voiceUrl" :autoplay="!hasAudio" :muted="!hasAudio" @play="onPlay" @pause="onPause" />
+      <canvas v-if="previewing" ref="pvCv" class="pv" aria-label="Vista previa en vivo" />
+      <video v-else-if="videoUrl" :src="videoUrl" controls playsinline :loop="lastDance ? hasAudio : !speechText && !voiceUrl" :autoplay="!hasAudio" :muted="!hasAudio" @play="onPlay" @pause="onPause" />
       <canvas v-else-if="bitmap" ref="cv" width="512" height="512" aria-label="Encuadre de la fotografía" @pointerdown="down" @pointermove="move" @pointerup="up" @pointercancel="up" />
       <label v-else class="empty">📷<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
     </div>
     <div class="row">
       <label class="btn">Elegir fotografía<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
       <button v-if="photoUrl" @click="clear()">Quitar</button>
-      <button v-if="videoUrl" @click="clear(false)">Ajustar encuadre</button>
+      <button v-if="videoUrl || previewing" @click="stopPreview(); clear(false)">Ajustar encuadre</button>
     </div>
     <div v-if="bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop)">↻ Girar</button></div>
+    <div v-if="dance && bitmap && musicName" class="row">
+      <button v-if="!previewing" :disabled="busy || pvBusy || analyzing" @click="startPreview">{{ pvBusy ? 'Preparando…' : '▶ Vista previa en vivo' }}</button>
+      <template v-else><button @click="pvToggle">{{ pvPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopPreview">✕ Cerrar vista previa</button></template>
+    </div>
     <div class="row seg"><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button></div>
     <template v-if="!dance">
       <label>¿Qué quieres que haga?
