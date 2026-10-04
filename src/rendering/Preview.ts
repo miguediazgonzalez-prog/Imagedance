@@ -57,7 +57,7 @@ export class Preview {
   /** Coreografía (BPM, compás, energía): se aplica al vuelo, sin cortar el sonido. null = quieto. */
   setSpec(spec: DanceSpec | null) { this.spec = spec; if (!this.playing) this.draw() }
   /** Plantilla de movimiento de un vídeo (imitación): manda sobre la coreografía; la música sigue moviendo los fondos. null = sin plantilla. */
-  setTemplate(tp: TplPlay | null) { this.tp = tp; if (!this.playing) this.draw() }
+  setTemplate(tp: TplPlay | null) { this.tp = tp; this.r.setArms(tp?.rig ?? null); if (!this.playing) this.draw() }
   /** Fondo + máscara de persona a la vez (sin fondo, la foto se ve tal cual y la máscara no se usa). */
   setBackground(bg?: BgSpec, mask?: Mask) { this.r.setBackground(bg); this.r.setMask(bg ? mask : undefined); if (!this.playing) this.draw() }
   /** Luz y sombra del fondo sobre la persona. */

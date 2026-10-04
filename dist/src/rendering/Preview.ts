@@ -4,6 +4,7 @@ import type { Pt } from '../ai/FaceLandmarks'
 import type { Mask } from '../ai/Segmenter'
 import { danceAt, motionAt, parseInstruction, type AnimationInstruction, type DanceSpec } from '../ai/MotionPlanner'
 import type { BgSpec } from './Backgrounds'
+import { templateFrame, type TplPlay } from '../ai/MotionTemplate'
 import { WarpRenderer } from './WarpRenderer'
 let ctx: AudioContext | undefined
 /** Llamar de forma síncrona dentro de un gesto del usuario (toque): iOS no deja arrancar audio de otra manera. */
@@ -11,7 +12,7 @@ export function unlockAudio(): AudioContext { ctx ??= new AudioContext(); if (ct
 const mod = (x: number, d: number) => ((x % d) + d) % d
 export class Preview {
   private r: WarpRenderer; private raf = 0; private last = 0; private dead = false
-  private spec: DanceSpec | null = null; private ins: AnimationInstruction = parseInstruction('', 5)
+  private spec: DanceSpec | null = null; private tp: TplPlay | null = null; private ins: AnimationInstruction = parseInstruction('', 5)
   private buf: AudioBuffer | null = null; private from = 0; private dur = 5; private node: AudioBufferSourceNode | null = null
   private since = 0; private still = 0; private playing = false   // posición local = (still + tiempo transcurrido desde play - latencia de salida) mod dur; `still` = posición al empezar/pausar
   constructor(canvas: HTMLCanvasElement, bmp: ImageBitmap, L: Pt[]) { this.r = new WarpRenderer(canvas, bmp, L); this.draw() }
@@ -23,12 +24,13 @@ export class Preview {
   private draw() {
     if (this.dead) return
     const t = this.time
-    if (this.spec) { const d = danceAt(t, this.spec); this.r.render(d.face, t, d.body) } else this.r.render(motionAt(t, this.ins), t)
+    if (this.tp) { const f = templateFrame(t, this.tp, this.spec); this.r.render(f.face, t, f.body) }
+    else if (this.spec) { const d = danceAt(t, this.spec); this.r.render(d.face, t, d.body) } else this.r.render(motionAt(t, this.ins), t)
   }
   private tick = (ms: number) => {
     if (this.dead || !this.playing) return
     this.raf = requestAnimationFrame(this.tick)
-    if (ms - this.last < 32) return   // ~30 fps: la deformación de malla se calcula en CPU
+    if (ms - this.last < (this.r.isGpu ? 15 : 32)) return   // ~60 fps con la malla en GPU; ~30 fps si la deformación cae a CPU
     this.last = ms; this.draw()
   }
   play() {
@@ -54,7 +56,11 @@ export class Preview {
   }
   /** Coreografía (BPM, compás, energía): se aplica al vuelo, sin cortar el sonido. null = quieto. */
   setSpec(spec: DanceSpec | null) { this.spec = spec; if (!this.playing) this.draw() }
+  /** Plantilla de movimiento de un vídeo (imitación): manda sobre la coreografía; la música sigue moviendo los fondos. null = sin plantilla. */
+  setTemplate(tp: TplPlay | null) { this.tp = tp; this.r.setArms(tp?.rig ?? null); if (!this.playing) this.draw() }
   /** Fondo + máscara de persona a la vez (sin fondo, la foto se ve tal cual y la máscara no se usa). */
   setBackground(bg?: BgSpec, mask?: Mask) { this.r.setBackground(bg); this.r.setMask(bg ? mask : undefined); if (!this.playing) this.draw() }
+  /** Luz y sombra del fondo sobre la persona. */
+  setIntegrate(on: boolean) { this.r.setIntegrate(on); if (!this.playing) this.draw() }
   dispose() { this.dead = true; cancelAnimationFrame(this.raf); this.stopNode(); this.r.dispose() }
 }

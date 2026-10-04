@@ -16,6 +16,8 @@ import { refineMask } from './ai/Matting'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
 import { Preview, unlockAudio } from './rendering/Preview'
 import { trackVideo, TRACK_MAX_S } from './ai/VideoTracker'
+import { detectArms } from './ai/BodyPose'
+import type { ArmRig } from './ai/ArmSkin'
 import { bodyScaleFor, makePlay, parseTemplate, serializeTemplate, type MotionTemplate, type SyncMode, type TplPlay } from './ai/MotionTemplate'
 const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
@@ -31,7 +33,7 @@ let diagBase = ''
 const busy = ref(false), status = ref(''), pct = ref(0), canShare = !!navigator.share
 // Vista previa en vivo: mismo renderizador que el export, a 512 px y ~30 fps
 const PV = 512, PV_FPS = 30, previewing = ref(false), pvBusy = ref(false), pvPlaying = ref(false), pvCv = ref<HTMLCanvasElement | null>(null)
-let pv: Preview | null = null, pvMask: Mask | undefined, pvSrc: HTMLCanvasElement | null = null, pvL: Pt[] | null = null, pvT = 0, pvA = false
+let pvRig: ArmRig | null | undefined, pvRigBusy = false, pv: Preview | null = null, pvMask: Mask | undefined, pvSrc: HTMLCanvasElement | null = null, pvL: Pt[] | null = null, pvT = 0, pvA = false
 const debug = new URLSearchParams(location.search).has('debug')
 // Baile con música + fondo
 const dance = ref(true), selTrack = ref(''), analyzing = ref(false), musicName = ref(''), musicUrl = ref(''), musicDur = ref(0), bpm = ref(0), startAt = ref(0)
@@ -116,7 +118,7 @@ async function pickBg(e: Event) {
 }
 // Imitar un vídeo: plantilla de movimientos (cabeza, expresión y torso) sacada de un vídeo de referencia y aplicada a la foto
 const tpl = shallowRef<MotionTemplate | null>(null), tplOn = ref(true), tplGain = ref(1), tplMirror = ref(false), tplMode = ref<SyncMode>('beat')
-const tplBusy = ref(false), tplPct = ref(0), tplNote = ref(''), refFile = shallowRef<File | null>(null)
+const tplArms = ref(true), tplBusy = ref(false), tplPct = ref(0), tplNote = ref(''), refFile = shallowRef<File | null>(null)
 let tplCtl: AbortController | null = null
 const MODES: { id: SyncMode; label: string; hint: string }[] = [
   { id: 'beat', label: '🥁 Al ritmo', hint: 'Ajusta el ciclo de baile al BPM de la canción y hace coincidir el golpe con el beat.' },
@@ -125,9 +127,16 @@ const MODES: { id: SyncMode; label: string; hint: string }[] = [
 ]
 const tplHint = computed(() => (tplMode.value === 'beat' && tpl.value && !(tpl.value.period && (tpl.value.periodConf ?? 0) >= 0.2)) ? 'Esta plantilla no tiene un ciclo repetido claro: en "Al ritmo" se reproduce tal cual.' : MODES.find(m => m.id === tplMode.value)!.hint)
 /** Plantilla lista para reproducir sobre la foto actual (null si no hay o está desactivada). */
-function tplPlay(L: Pt[], W: number, H: number, spec: DanceSpec | null, startAtS: number): TplPlay | null {
-  return tpl.value && tplOn.value ? makePlay(tpl.value, { mode: tplMode.value, gain: tplGain.value, mirror: tplMirror.value, sc: bodyScaleFor(L, W, H), startAt: startAtS, spec }) : null
+function tplPlay(L: Pt[], W: number, H: number, spec: DanceSpec | null, startAtS: number, rig?: ArmRig | null): TplPlay | null {
+  return tpl.value && tplOn.value ? makePlay(tpl.value, { mode: tplMode.value, gain: tplGain.value, mirror: tplMirror.value, sc: bodyScaleFor(L, W, H), startAt: startAtS, spec, rig: tplArms.value ? rig : null }) : null
 }
+/** Brazos de la foto, solo si la plantilla trae brazos y se piden. Si el modelo de cuerpo falla, sigue sin brazos (cabeza y torso funcionan igual). */
+const tplWantsArms = () => !!(tpl.value && tplOn.value && tplArms.value && (tpl.value.armL || tpl.value.armR))
+async function armsOf(src: HTMLCanvasElement): Promise<ArmRig | null> {
+  if (!tplWantsArms()) return null
+  try { return await detectArms(src) } catch (e) { status.value = (e instanceof Error ? e.message : String(e)) + ' Sigo sin mover los brazos.'; return null }
+}
+const rigNote = (rig: ArmRig | null) => (!rig ? '' : rig.l && rig.r ? ' Mueve los dos brazos.' : rig.l || rig.r ? ' Solo se ve un brazo en la foto: mueve ese.' : ' En esta foto no se ven los brazos enteros (hombro, codo y muñeca): para moverlos, usa una foto de medio cuerpo con los brazos visibles.')
 async function pickRefVideo(e: Event) {
   const input = e.target as HTMLInputElement, f = input.files?.[0]; input.value = ''; if (!f || tplBusy.value) return
   tplBusy.value = true; tplPct.value = 0; tplCtl = new AbortController(); stopPreview(); clear(false)
@@ -208,6 +217,8 @@ async function generate() {
       mask = refineMask(await segmentPerson(src, L[1]), src)
       bg = bgId.value === 'image' ? { id: 'image', bitmap: await coverBitmap(bgBmp.value!, D.W, D.H) } : { id: bgId.value }
     }
+    let rig: ArmRig | null = null
+    if (dance.value && tplWantsArms()) { status.value = 'Buscando los brazos en la foto… (la primera vez se descarga el modelo de cuerpo)'; await new Promise(r => setTimeout(r, 30)); rig = await armsOf(src) }
     const input = await createImageBitmap(src); let job: Parameters<typeof renderVideo>[0], buf: AudioBuffer | null = null, ins = parseInstruction('', T.d)
     speechText.value = ''
     if (dance.value) {
@@ -215,7 +226,7 @@ async function generate() {
       if (!spectral) { status.value = 'Analizando compases y secciones…'; await new Promise(r => setTimeout(r, 30)); await ensureStructure() }
       const spec = makeDance(T.fps, t0, dur, frames)
       ins = { duration: dur, eyeMovement: 'camera', intensity: 0.65 }
-      job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, tpl: tplPlay(L, D.W, D.H, spec, t0) ?? undefined, bg, mask, integrate: integrate.value }
+      job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, tpl: tplPlay(L, D.W, D.H, spec, t0, rig) ?? undefined, bg, mask, integrate: integrate.value }
       playUrl.value = musicUrl.value; playFrom = t0; aud = null
     } else {
       buf = voiceBuf.value
@@ -233,7 +244,7 @@ async function generate() {
     modelStatus().then(v => (modelMb.value = v))
     hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); diagBase = `build ${BUILD} · ${out.value.audioInfo ? 'audio ' + out.value.audioInfo : 'audio: no codificado'}`; diag.value = diagBase
     const why = out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : ''
-    status.value = dance.value ? (hasAudio.value ? `Listo: ${job.tpl ? `imita «${tpl.value!.name}» y baila` : 'baila'} a ${bpm.value} BPM con tu música.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
+    status.value = dance.value ? (hasAudio.value ? `Listo: ${job.tpl ? `imita «${tpl.value!.name}» y baila` : 'baila'} a ${bpm.value} BPM con tu música.${job.tpl ? rigNote(rig) : ''}` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : buf ? (hasAudio.value ? 'Listo, con tu voz.' : 'Listo. Este dispositivo no mezcla audio en el vídeo: tu voz suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : ins.speech ? 'Listo. La voz del texto solo suena en la vista previa (el navegador no deja capturarla): el archivo sale sin audio. Para llevar voz en el archivo, graba la tuya.' : 'Listo.'
   } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { busy.value = false }
@@ -244,7 +255,11 @@ function pvSync(audio: boolean) {
   const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
   if (audio) pv.setClip(musicBuf, startAt.value, dur)
   const spec = makeDance(PV_FPS, startAt.value, dur, frames)
-  pv.setSpec(spec); pv.setTemplate(tplPlay(pvL!, pvSrc!.width, pvSrc!.height, spec, startAt.value))
+  pv.setSpec(spec); pv.setTemplate(tplPlay(pvL!, pvSrc!.width, pvSrc!.height, spec, startAt.value, pvRig))
+  if (pvRig === undefined && tplWantsArms() && !pvRigBusy) {   // los brazos de la foto se buscan una vez, sin parar la vista previa
+    pvRigBusy = true; const src = pvSrc!
+    armsOf(src).then(r => { if (pvSrc !== src) return; pvRig = r ?? null; if (r) status.value = 'Vista previa en vivo.' + rigNote(r); pvLater(false) }).finally(() => { pvRigBusy = false })
+  }
 }
 /** Agrupa cambios seguidos (p. ej. al arrastrar el deslizador de inicio) para no reiniciar el sonido a cada pixel. */
 function pvLater(audio: boolean) { if (!pv) return; pvA ||= audio; clearTimeout(pvT); pvT = window.setTimeout(() => { const a = pvA; pvA = false; pvSync(a) }, 120) }
@@ -274,13 +289,13 @@ async function startPreview() {
     if (pv) { pv.play(); pvPlaying.value = true; status.value = 'Vista previa en vivo: cambia fondo, canción o BPM y se aplica al instante. Cuando te guste, pulsa Animar.' }
   } catch (e) { stopPreview(); status.value = e instanceof Error ? e.message : String(e) } finally { pvBusy.value = false }
 }
-function stopPreview() { clearTimeout(pvT); pvA = false; pv?.dispose(); pv = null; pvMask = undefined; pvSrc = null; pvL = null; previewing.value = false; pvPlaying.value = false }
+function stopPreview() { clearTimeout(pvT); pvA = false; pvRig = undefined; pv?.dispose(); pv = null; pvMask = undefined; pvSrc = null; pvL = null; previewing.value = false; pvPlaying.value = false }
 const pvToggle = () => { pvPlaying.value = pv ? pv.toggle() : false }
 const onHide = () => { if (document.hidden && pv?.isPlaying) { pv.pause(); pvPlaying.value = false } }
 onMounted(() => document.addEventListener('visibilitychange', onHide))
 onBeforeUnmount(() => { document.removeEventListener('visibilitychange', onHide); stopPreview() })
 watch([bgId, bgBmp], () => { pvBg() }); watch(integrate, v => pv?.setIntegrate(v))
-watch([tpl, tplOn, tplGain, tplMirror, tplMode], () => pvLater(false)); watch(startAt, () => pvLater(true)); watch(tier, () => pvLater(true)); watch([bpm, barShift], () => pvLater(false))
+watch([tpl, tplOn, tplGain, tplMirror, tplMode, tplArms], () => pvLater(false)); watch(startAt, () => pvLater(true)); watch(tier, () => pvLater(true)); watch([bpm, barShift], () => pvLater(false))
 watch(dance, v => { if (!v) stopPreview() })
 function setFmt(f: 'sq' | 'v') { if (fmt.value === f) return; stopPreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
 const fname = () => `foto-animada.${out.value!.ext}`
@@ -345,6 +360,7 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
           <div class="st">{{ tplHint }}</div>
           <label class="st">Fuerza de la imitación: {{ tplGain.toFixed(1) }}×<input type="range" min="0.3" max="2" step="0.1" v-model.number="tplGain" style="width:100%" /></label>
           <label class="st"><input type="checkbox" v-model="tplMirror" /> Reflejar (si el vídeo era un selfie y salen al revés)</label>
+          <label v-if="tpl.armL || tpl.armR" class="st"><input type="checkbox" v-model="tplArms" /> Mover brazos y manos (necesita que se vean en la foto)</label>
         </template>
         <div class="row"><button v-if="refFile" :disabled="busy || analyzing" @click="useRefAudio">🎵 Usar su audio</button><button @click="saveTpl">💾 Guardar plantilla</button><button @click="clearTpl">Quitar</button></div>
       </template>

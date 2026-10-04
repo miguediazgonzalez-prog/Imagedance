@@ -55,7 +55,8 @@ export interface DanceSpec {
   bands?: ArrayLike<number>
 }
 /** bass/mid/treble (0..1): nivel de graves, medios y agudos de la canción en ese instante (los fondos reaccionan a ellos). */
-export interface BodyMotion { swayX: number; roll: number; squash: number; zoom: number; pulse: number; bass?: number; mid?: number; treble?: number }
+import type { ArmRot } from './ArmSkin'
+export interface BodyMotion { arms?: { l?: ArmRot; r?: ArmRot }; swayX: number; roll: number; squash: number; zoom: number; pulse: number; bass?: number; mid?: number; treble?: number }
 /** Figuras: sway = balanceo lateral, bob = rebote vertical, yaw = giro de cabeza, nod = cabeceo, roll = inclinación, lean = ladeo lento de 4 tiempos. */
 const MOVES = [
   { sway: 1, bob: 0.6, yaw: 0.5, nod: 0.8, roll: 1, lean: 0 },      // balanceo clásico

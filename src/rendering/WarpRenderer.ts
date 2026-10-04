@@ -4,6 +4,7 @@ import type { Pt } from '../ai/FaceLandmarks'
 import type { FacialMotion, BodyMotion } from '../ai/MotionPlanner'
 import type { Mask } from '../ai/Segmenter'
 import { bgFragment, bgGlsl, type BgId, type BgSpec } from './Backgrounds'
+import { armDisp, armUniforms, type ArmRig } from '../ai/ArmSkin'
 const N = 96
 type GpuProg = { p: WebGLProgram; u: Record<string, WebGLUniformLocation | null> }
 /** Giro 3D de cabeza: radianes por unidad de headYaw / headPitch, fracción de fs que baja el pivote desde la línea de las orejas (hacia el cuello) y ganancia de la profundidad de los landmarks. */
@@ -58,7 +59,9 @@ const PASS_HEAD = `#version 300 es
 precision highp float; precision highp int; precision highp sampler2D; out vec4 o;
 float g(float d,float r){float q=d/r; return exp(-q*q);}
 `
-const WARP_FRAG = PASS_HEAD + `uniform sampler2D S; uniform vec4 uE[2], uI[2], uB[2], uM[2]; uniform vec4 uP0, uP1, uC, uR0, uF, uBody; uniform vec2 uR1, uWH, uBody2;
+const WARP_FRAG = PASS_HEAD + `uniform sampler2D S; uniform vec4 uE[2], uI[2], uB[2], uM[2]; uniform vec4 uP0, uP1, uC, uR0, uF, uBody, uA[6]; uniform vec2 uR1, uWH, uBody2;
+vec2 rotA(vec2 p, vec2 c, float a){ float cs=cos(a), sn=sin(a); vec2 d=p-c; return c+vec2(d.x*cs-d.y*sn, d.x*sn+d.y*cs); }
+float segD(vec2 p, vec2 a, vec2 b, out float t){ vec2 ab=b-a; t=dot(p-a,ab)/max(dot(ab,ab),1e-6); return length(p-(a+ab*clamp(t,0.,1.))); }
 void main(){
   ivec2 q=ivec2(gl_FragCoord.xy); float x=float(q.x)/${F(N)}*uWH.x, y=float(q.y)/${F(N)}*uWH.y, X=x, Y=y, fs=uP1.w;
   for(int k=0;k<2;k++){ vec4 e=uE[k], ir=uI[k];
@@ -67,6 +70,11 @@ void main(){
   for(int k=0;k<2;k++){ vec4 b=uB[k]; Y-=b.z*fs*.03*g(length(vec2(x-b.x,y-b.y)),fs*.13); }
   for(int k=0;k<2;k++){ vec4 m=uM[k]; float w=g(length(vec2(x-m.x,y-m.y)),fs*.13); Y-=uP1.x*fs*.05*w; X+=(k==1?1.:-1.)*(uP1.x*.025+(uP1.y-.5)*.05-uP1.z*.03)*fs*w; }
   if(y>uP0.z) Y+=uP0.w*fs*.09*g(length(vec2(x-uP0.x,y-uP0.y)),fs*.13);
+  for(int k=0;k<2;k++){ vec4 A0=uA[3*k], A1=uA[3*k+1], A2=uA[3*k+2];   // brazos y manos (misma fórmula que armDisp en ArmSkin.ts)
+    if(A2.w>0.){ vec2 p0=vec2(x,y), S0=A0.xy, E0=A0.zw, W0=A1.xy, H0=A1.zw; float R=A2.w, tu, tf, th;
+      float wu=exp(-pow(segD(p0,S0,E0,tu)/R,4.))*smoothstep(-.05,.3,tu), wf=exp(-pow(segD(p0,E0,W0,tf)/R,4.)), wh=exp(-pow(segD(p0,W0,H0,th)/(R*.7),4.)), sw=wu+wf+wh;
+      if(sw>1e-4){ vec2 E1=rotA(E0,S0,A2.x), W1=rotA(rotA(W0,S0,A2.x),E1,A2.y), pu=rotA(p0,S0,A2.x), pf=rotA(pu,E1,A2.y), ph=rotA(pf,W1,A2.z), pn=(pu*wu+pf*wf+ph*wh)/sw;
+        float inf=max(wu,max(wf,wh)); X+=inf*(pn.x-x); Y+=inf*(pn.y-y); } } }
   vec4 s=texelFetch(S,q,0); float hw=s.x, zb=s.y, Z=0., Sh=1.;
   if(hw>.002){
     vec2 P=uC.zw; float t0=uR0.x,t1=uR0.y,t2=uR0.z,t3=uR0.w,t4=uR1.x,t5=uR1.y, f=fs*6., dx=X-P.x, dy=Y-P.y;
@@ -95,7 +103,7 @@ export class WarpRenderer {
   private gpu = false; private G!: { tex: WebGLTexture[]; fbo: WebGLFramebuffer[]; S: WebGLTexture; pw: GpuProg; ps: GpuProg; pf: GpuProg; uE: Float32Array; uI: Float32Array; uB: Float32Array; uM: Float32Array }
   /** true si la deformación de la malla se calcula en la GPU (si no, en CPU). */
   get isGpu() { return this.gpu } private zLip = 0; private piv = { x: 0, y: 0 }; private tr = new Float64Array(6); private tmp = new Float64Array(3)
-  private bgs = new Map<BgId, BgProg>(); private bgp?: BgProg; private ig = 1; private bvao!: WebGLVertexArrayObject; private tMask!: WebGLTexture; private tBg!: WebGLTexture; private um: WebGLUniformLocation | null = null
+  private arms: ArmRig | null = null; private uA = new Float32Array(24); private bgs = new Map<BgId, BgProg>(); private bgp?: BgProg; private ig = 1; private bvao!: WebGLVertexArrayObject; private tMask!: WebGLTexture; private tBg!: WebGLTexture; private um: WebGLUniformLocation | null = null
   private vsMesh!: WebGLShader; private mp!: WebGLProgram; private mvao!: WebGLVertexArrayObject; private ip!: WebGLProgram; private ivao!: WebGLVertexArrayObject; private ie!: WebGLUniformLocation
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, src: ImageBitmap, private L: Pt[], bg?: BgSpec, mask?: Mask, useGpu = true) {
     const W = (canvas.width = src.width), H = (canvas.height = src.height); this.W = W; this.H = H
@@ -170,6 +178,8 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
     if (bg.id === 'image' && bg.bitmap) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tBg); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bg.bitmap); gl.activeTexture(gl.TEXTURE0) }
     this.bgp = b
   }
+  /** Esqueleto de brazos de la foto (null = brazos quietos). Los giros de cada fotograma llegan en BodyMotion.arms. */
+  setArms(rig: ArmRig | null) { this.arms = rig }
   /** Luz y sombra del fondo sobre la persona (solo con fondo y máscara). */
   setIntegrate(on: boolean) { this.ig = on ? 1 : 0 }
   /** Libera el contexto WebGL (la vista previa crea y destruye renderizadores; los navegadores limitan los contextos vivos). */
@@ -221,6 +231,7 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
       for (const b of brows) Y -= b.v * fs * 0.03 * g(Math.hypot(x - b.p.x, y - b.p.y), fs * 0.13)
       mc.forEach((p, i) => { const w = g(Math.hypot(x - p.x, y - p.y), fs * 0.13); Y -= m.mouthSmile * fs * 0.05 * w; X += (i ? 1 : -1) * (m.mouthSmile * 0.025 + (m.mouthWidth - 0.5) * 0.05 - m.lipRound * 0.03) * fs * w })
       if (y > mid.y) Y += m.mouthOpen * fs * 0.09 * g(Math.hypot(x - lip.x, y - lip.y), fs * 0.13)
+      if (this.arms && b?.arms) for (const side of ['l', 'r'] as const) { const jt = this.arms[side], rt = b.arms[side]; if (jt && rt) { const d = armDisp(x, y, jt, rt); X += d[0]; Y += d[1] } }   // brazos y manos
       const w = hw[j]
       if (w > 0.002) { this.project(X, Y, zb[j]); X += (o[0] - X) * w; Y += (o[1] - Y) * w; Z = o[2] * w
         const a = n0[3 * j], bb = n0[3 * j + 1], c = n0[3 * j + 2], x1 = a * tr[0] + c * tr[1], z1 = -a * tr[1] + c * tr[0], y2 = bb * tr[2] + z1 * tr[3], z2 = -bb * tr[3] + z1 * tr[2]   // normal girada con la misma R
@@ -243,7 +254,7 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
       if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.warn('GPU warp:', gl.getShaderInfoLog(b) || gl.getProgramInfoLog(p)); gl.deleteProgram(p); return null }
       return { p, u: Object.fromEntries(names.map(n => [n, gl.getUniformLocation(p, n)])) }
     }
-    const pw = prog(WARP_FRAG, ['S', 'uE', 'uI', 'uB', 'uM', 'uP0', 'uP1', 'uC', 'uR0', 'uF', 'uBody', 'uR1', 'uWH', 'uBody2'])
+    const pw = prog(WARP_FRAG, ['S', 'uE', 'uI', 'uB', 'uM', 'uP0', 'uP1', 'uC', 'uR0', 'uF', 'uBody', 'uR1', 'uWH', 'uBody2', 'uA'])
     const ps = prog(SMOOTH_FRAG, ['T', 'S', 'horiz']), pf = prog(FINAL_FRAG, ['T', 'O', 'amt', 'uE', 'uI', 'uG', 'uWH'])
     if (!pw || !ps || !pf) return false
     const mk = (unit: number, data: Float32Array | null) => {
@@ -282,6 +293,7 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
     gl.uniform4f(pw.u.uP0, L[14].x, L[14].y, L[13].y, m.mouthOpen); gl.uniform4f(pw.u.uP1, m.mouthSmile, m.mouthWidth, m.lipRound, fs)
     gl.uniform4f(pw.u.uC, L[1].x, L[1].y, this.piv.x, this.piv.y); gl.uniform4f(pw.u.uR0, tr[0], tr[1], tr[2], tr[3]); gl.uniform2f(pw.u.uR1, tr[4], tr[5])
     gl.uniform4f(pw.u.uF, tr[1] * tr[4] - fy0 * tr[5], tr[1] * tr[5] + fy0 * tr[4], tr[0] * tr[2], 0); gl.uniform2f(pw.u.uWH, W, H)
+    armUniforms(this.arms, b?.arms, this.uA); gl.uniform4fv(pw.u.uA, this.uA)
     gl.uniform4f(pw.u.uBody, b?.zoom ?? 1, b?.squash ?? 1, b ? Math.cos(b.roll) : 1, b ? Math.sin(b.roll) : 0); gl.uniform2f(pw.u.uBody2, b?.swayX ?? 0, b ? 1 : 0)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     let cur = 0
