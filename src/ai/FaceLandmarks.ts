@@ -1,6 +1,7 @@
 /** Detección de 478 landmarks con MediaPipe Face Landmarker (WASM + GPU, con caída a CPU). */
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
-export interface Pt { x: number; y: number }
+/** z = profundidad relativa en píxeles (MediaPipe la da en la escala del ancho); opcional por si hay landmarks sin profundidad. */
+export interface Pt { x: number; y: number; z?: number }
 const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
 let lm: FaceLandmarker | undefined, used = 'CPU'
@@ -17,5 +18,5 @@ async function load(): Promise<FaceLandmarker> {
 export async function detect(src: HTMLCanvasElement): Promise<Pt[] | null> {
   lm ??= await load()
   const f = lm.detect(src).faceLandmarks[0]
-  return f ? f.map(p => ({ x: p.x * src.width, y: p.y * src.height })) : null
+  return f ? f.map(p => ({ x: p.x * src.width, y: p.y * src.height, z: p.z * src.width })) : null
 }
