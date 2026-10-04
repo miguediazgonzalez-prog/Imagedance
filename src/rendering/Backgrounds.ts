@@ -88,14 +88,22 @@ const FN: Record<BgId, string> = {
   vec3 c=col*(.2+.8*s*t)*smoothstep(0.,.35,r); return c*(.85+.5*P); }`,
   image: `vec3 bg(vec2 u){ vec2 q=(u-.5)*(1.-.05*P)+.5; return texture(img,q).rgb*(1.+.12*P); }`
 }
-/** Fragment shader completo del fondo elegido (uv con y hacia abajo, igual que la foto). */
-export const bgFragment = (id: BgId) => `#version 300 es
-precision highp float; in vec2 v; uniform float T; uniform float P; uniform sampler2D img; uniform float A; out vec4 o;
+/** GLSL común (uniformes, utilidades, el fondo elegido y su reacción al espectro). Lo comparten el pase del fondo y el pase de la persona (que lo usa para la luz envolvente). */
+export const bgGlsl = (id: BgId) => `uniform float T; uniform float P; uniform vec3 S; uniform sampler2D img; uniform float A;
 float h21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(h21(i),h21(i+vec2(1.,0.)),f.x),mix(h21(i+vec2(0.,1.)),h21(i+vec2(1.,1.)),f.x),f.y); }
 float fbm(vec2 p){ float a=.5, s=0.; for(int k=0;k<5;k++){ s+=a*vn(p); p=p*2.03+vec2(1.7,9.2); a*=.5; } return s; }
 ${FN[id]}
-void main(){ o=vec4(clamp(bg(vec2((v.x-.5)*A+.5,v.y)),0.,1.),1.); }`  // A = ancho/alto: en lienzos no cuadrados se ve la franja central, sin deformar
+// s = uv de pantalla (y hacia abajo). A = ancho/alto: en lienzos no cuadrados se ve la franja central, sin deformar.
+// Espectro S = (graves, medios, agudos) 0..1: graves → el fondo respira y brilla; medios → más color; agudos → destellos.
+vec3 bgx(vec2 s){
+  vec2 u=vec2((s.x-.5)*A+.5,s.y); vec2 c=(u-.5)*(1.-.045*S.x)+.5;
+  vec3 col=bg(c)*(1.+.2*S.x); float g=dot(col,vec3(.299,.587,.114)); col=mix(vec3(g),col,1.+.7*S.y);
+  float tw=h21(floor(u*60.)+floor(T*12.)); col+=vec3(1.,.96,.9)*step(.985-.03*S.z,tw)*S.z*.75;
+  return col;
+}`
+/** Fragment shader completo del fondo elegido (uv con y hacia abajo, igual que la foto). */
+export const bgFragment = (id: BgId) => `#version 300 es\nprecision highp float; in vec2 v; out vec4 o;\n${bgGlsl(id)}\nvoid main(){ o=vec4(clamp(bgx(v),0.,1.),1.); }`
 /** Recorta la imagen elegida a W×H (modo «cubrir»; H = W si es cuadrada) para usarla de fondo. */
 export async function coverBitmap(src: ImageBitmap, W: number, H = W): Promise<ImageBitmap> {
   const c = document.createElement('canvas'); c.width = W; c.height = H

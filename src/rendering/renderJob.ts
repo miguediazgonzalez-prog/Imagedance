@@ -5,11 +5,13 @@ import { motionAt, danceAt, type AnimationInstruction, type VisemeFrame, type Da
 import { WarpRenderer } from './WarpRenderer'
 import type { BgSpec } from './Backgrounds'
 import { encodeVideo } from './VideoEncoder'
-export interface RenderJob { src: ImageBitmap; lm: Pt[]; ins: AnimationInstruction; vis?: VisemeFrame[]; dur: number; fps: number; audio?: { mono: Float32Array; sampleRate: number }; dance?: DanceSpec; bg?: BgSpec; mask?: Mask }
+import { templateFrame, type TplPlay } from '../ai/MotionTemplate'
+export interface RenderJob { src: ImageBitmap; lm: Pt[]; ins: AnimationInstruction; vis?: VisemeFrame[]; dur: number; fps: number; audio?: { mono: Float32Array; sampleRate: number }; dance?: DanceSpec; tpl?: TplPlay; bg?: BgSpec; mask?: Mask; integrate?: boolean }
 export function runJob(j: RenderJob, canvas: HTMLCanvasElement | OffscreenCanvas, onProgress: (p: number) => void) {
-  const r = new WarpRenderer(canvas, j.src, j.lm, j.bg, j.mask)
+  const r = new WarpRenderer(canvas, j.src, j.lm, j.bg, j.mask); r.setIntegrate(j.integrate ?? true)
   return encodeVideo(canvas, Math.round(j.dur * j.fps), j.fps, i => {
     const t = i / j.fps
-    if (j.dance) { const d = danceAt(t, j.dance); r.render(d.face, t, d.body) } else r.render(motionAt(t, j.ins, j.vis), t)
+    if (j.tpl) { const f = templateFrame(t, j.tpl, j.dance); r.render(f.face, t, f.body) }
+    else if (j.dance) { const d = danceAt(t, j.dance); r.render(d.face, t, d.body) } else r.render(motionAt(t, j.ins, j.vis), t)
   }, onProgress, j.audio)
 }
