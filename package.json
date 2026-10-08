@@ -7,7 +7,7 @@
   "dev": "vite --host",
   "build": "vue-tsc --noEmit && vite build",
   "preview": "vite preview --host",
-  "test": "tsx tests/motionTemplate.test.ts"
+  "test": "tsx tests/motionTemplate.test.ts && tsx tests/montage.test.ts"
  },
  "dependencies": {
   "@mediapipe/tasks-vision": "^0.10.14",

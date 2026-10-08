@@ -19,7 +19,12 @@ import { trackVideo, TRACK_MAX_S } from './ai/VideoTracker'
 import { detectArms } from './ai/BodyPose'
 import type { ArmRig } from './ai/ArmSkin'
 import { bodyScaleFor, makePlay, parseTemplate, serializeTemplate, type MotionTemplate, type SyncMode, type TplPlay } from './ai/MotionTemplate'
-const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 10, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 15, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 20, label: 'Alta · 1024 px · 10 s' } }
+import { MontagePreview } from './rendering/MontagePreview'
+import { renderMontage } from './rendering/renderClient'
+import type { MPhoto, TplCfg } from './rendering/MontageRenderer'
+import type { Style } from './rendering/Montage'
+import { loadPhoto, prepare, disposePhoto, MAX_PHOTOS, type MPhotoRec } from './montage/photos'
+const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 60, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 60, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 60, label: 'Alta · 1024 px · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 // Formato de salida: cuadrado 1:1 o vertical 9:16 (redes). El vertical conserva el nº de píxeles de la talla elegida: 512→384×682, 768→576×1024, 1024→768×1366
 const fmt = ref<'sq' | 'v'>('sq'), AR = computed(() => (fmt.value === 'v' ? 9 / 16 : 1))
@@ -93,7 +98,7 @@ const setBpm = (v: number) => { bpm.value = Math.min(240, Math.max(40, Math.roun
 function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null; enKey = ''; spectral = null; structP = null; barsKey = ''; g0Key = ''; barShift.value = 0; bars.value = null }
 /** Carga una canción (subida o incluida), la analiza y deja lista la edición. `known` = BPM exacto de las incluidas; `auto` = carga silenciosa al abrir la app. */
 async function loadMusic(blob: Blob, name: string, known?: number, trackId = '', auto = false) {
-  analyzing.value = true; clear(false); clearMusic(); if (!auto) status.value = 'Leyendo el audio…'
+  analyzing.value = true; stopMontagePreview(); clear(false); clearMusic(); if (!auto) status.value = 'Leyendo el audio…'
   try {
     const buf = await decodeAudio(blob); if (!auto) status.value = 'Calculando el ritmo…'; await new Promise(r => setTimeout(r, 30))
     musicBuf = buf; musicMono = toMono(buf); tempo = analyzeTempo(musicMono, buf.sampleRate); gridOrigin = known ? 0 : null
@@ -161,11 +166,121 @@ function saveTpl() {
   a.href = u; a.download = `${tpl.value.name || 'plantilla'}.movimiento.json`; a.click(); setTimeout(() => URL.revokeObjectURL(u), 2000)
 }
 function clearTpl() { tplCtl?.abort(); tpl.value = null; refFile.value = null; tplNote.value = '' }
+// ───────────── Montaje: varias fotos, todas las personas de cada foto, un único vídeo ─────────────
+const mont = ref(false), mPhotos = shallowRef<MPhotoRec[]>([]), mStyle = ref<Style>('dynamic'), mAdding = ref(false)
+const STYLES: { id: Style; label: string; hint: string }[] = [
+  { id: 'soft', label: '🎞 Elegante', hint: 'Planos largos, cámara suave y transiciones limpias.' },
+  { id: 'dynamic', label: '⚡ Dinámico', hint: 'Cortes al compás, un zoom con cada beat y destellos en los cambios de sección.' },
+  { id: 'extreme', label: '💥 Explosivo', hint: 'Cortes muy rápidos, cámara que golpea, glitch RGB y sacudida en los drops.' }
+]
+const mPeople = computed(() => mPhotos.value.reduce((n, p) => n + p.faces.length, 0))
+const mHint = computed(() => !mPhotos.value.length ? 'Elige entre 1 y ' + MAX_PHOTOS + ' fotos: cada persona que se vea baila a su manera y el montaje corta al ritmo de la música.' : `${mPhotos.value.length} foto${mPhotos.value.length > 1 ? 's' : ''} · ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'}. ${STYLES.find(x => x.id === mStyle.value)!.hint}`)
+const tick = () => new Promise(r => setTimeout(r, 30))
+async function addPhotos(e: Event) {
+  const input = e.target as HTMLInputElement, files = [...(input.files ?? [])]; input.value = ''; if (!files.length || mAdding.value) return
+  stopMontagePreview(); clear(false); mAdding.value = true
+  try {
+    const room = MAX_PHOTOS - mPhotos.value.length, take = files.slice(0, Math.max(0, room)), got: MPhotoRec[] = []; let bad = 0
+    for (const [i, f] of take.entries()) {
+      status.value = `Buscando personas en la foto ${i + 1} de ${take.length}… (la primera vez se descarga el modelo)`; await tick()
+      try { got.push(await loadPhoto(f)) } catch { bad++ }
+    }
+    mPhotos.value = [...mPhotos.value, ...got]
+    const none = got.filter(p => !p.faces.length).length
+    status.value = [got.length ? `${got.length} foto${got.length > 1 ? 's' : ''} añadida${got.length > 1 ? 's' : ''}.` : '', none ? `${none} sin rostro detectado: saldrá como imagen fija con cámara.` : '', bad ? `${bad} no se pudo abrir (¿HEIC?; prueba JPG, PNG o WebP).` : '', files.length > take.length ? `Máximo ${MAX_PHOTOS} fotos.` : ''].filter(Boolean).join(' ')
+  } catch (err) { status.value = err instanceof Error ? err.message : String(err) } finally { mAdding.value = false }
+}
+function removePhoto(id: number) { stopMontagePreview(); clear(false); const r = mPhotos.value.find(p => p.id === id); if (r) disposePhoto(r); mPhotos.value = mPhotos.value.filter(p => p.id !== id) }
+function movePhoto(i: number, d: number) { const a = [...mPhotos.value], j = i + d; if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; mPhotos.value = a; mpvLater(false, true) }
+function clearPhotos() { stopMontagePreview(); clear(false); mPhotos.value.forEach(disposePhoto); mPhotos.value = [] }
+function setMont(v: boolean) { if (v === mont.value) return; stopPreview(); stopMontagePreview(); clear(false); mont.value = v; if (v) dance.value = true; status.value = '' }
+const tplCfg = (t0: number): TplCfg | undefined => (tpl.value && tplOn.value ? { tpl: tpl.value, mode: tplMode.value, gain: tplGain.value, mirror: tplMirror.value, startAt: t0 } : undefined)
+/** Fotos preparadas para el motor al tamaño pedido; con fondo elegido, también el recorte de las personas de cada foto (si una falla, esa foto sale sin cambiar el fondo). */
+async function mPrep(long: number, withBg: boolean) {
+  const prep: { cv: HTMLCanvasElement; faces: Pt[][] }[] = [], photos: MPhoto[] = [], id = bgId.value; let failed = ''
+  for (const [i, r] of mPhotos.value.entries()) {
+    const p = await prepare(r, long); let bg: BgSpec | undefined, mask: Mask | undefined
+    if (withBg && id !== 'none' && p.faces.length) {
+      status.value = `Separando a las personas del fondo… ${i + 1} de ${mPhotos.value.length}`; await tick()
+      try { mask = refineMask(await segmentPerson(p.cv, p.faces[0][1]), p.cv); bg = id === 'image' ? { id, bitmap: await coverBitmap(bgBmp.value!, p.cv.width, p.cv.height) } : { id } } catch (e) { failed = e instanceof Error ? e.message : String(e) }
+    }
+    prep.push({ cv: p.cv, faces: p.faces }); photos.push({ src: p.src, faces: p.faces, bg, mask })
+  }
+  if (failed) status.value = failed
+  return { prep, photos }
+}
+const closeAll = (ps: MPhoto[]) => ps.forEach(p => { p.src.close(); p.bg?.bitmap?.close() })
+async function generateMontage() {
+  if (!mPhotos.value.length || busy.value) return
+  if (!musicBuf) { status.value = 'Sube primero la música con la que quieres que bailen.'; return }
+  if (bgId.value === 'image' && !bgBmp.value) { status.value = 'Elige una imagen para el fondo o selecciona otro fondo.'; return }
+  busy.value = true; stopMontagePreview(); clear(false); let photos: MPhoto[] = []
+  try {
+    const T = tiers[tier.value], D = dimsFor(T.s), long = Math.min(1800, Math.round(Math.max(D.W, D.H) * 1.35))
+    status.value = 'Preparando las fotos…'; await tick()
+    photos = (await mPrep(long, true)).photos
+    const sr = musicBuf.sampleRate, frames = Math.floor(danceDur.value * T.fps), dur = frames / T.fps, t0 = startAt.value
+    if (!spectral) { status.value = 'Analizando compases y secciones…'; await tick(); await ensureStructure() }
+    const spec = makeDance(T.fps, t0, dur, frames)
+    playUrl.value = musicUrl.value; playFrom = t0; aud = null; lastDance.value = true; speechText.value = ''
+    status.value = 'Montando el vídeo…'
+    const res = await renderMontage({ photos, ow: D.W, oh: D.H, fps: T.fps, dur, spec, style: mStyle.value, tpl: tplCfg(t0), integrate: integrate.value, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr } }, p => (pct.value = Math.round(p * 100)))
+    out.value = res.out; mode.value = `En uso: montaje · render ${res.where === 'worker' ? 'en worker' : 'en hilo principal'} · ${res.out.ext.toUpperCase()}`
+    hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); diagBase = `build ${BUILD} · ${out.value.audioInfo ? 'audio ' + out.value.audioInfo : 'audio: no codificado'}`; diag.value = diagBase
+    status.value = hasAudio.value ? `Listo: montaje de ${mPhotos.value.length} foto${mPhotos.value.length > 1 ? 's' : ''} y ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'} a ${bpm.value} BPM.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + (out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : '')
+  } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { closeAll(photos); busy.value = false }
+}
+// Vista previa en vivo del montaje (mismo motor que el export, a 512 px)
+const mpCv = ref<HTMLCanvasElement | null>(null), mPreviewing = ref(false), mPvBusy = ref(false), mPlaying = ref(false)
+let mpv: MontagePreview | null = null, mpvT = 0, mpvA = false, mpvPrep: { cv: HTMLCanvasElement; faces: Pt[][] }[] = [], mpvMasks = new Map<number, Mask>(), mpvGen = 0
+function mpvSync(audio: boolean) {
+  if (!mpv || !musicBuf || bpm.value <= 0) return
+  const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
+  if (audio) mpv.setClip(musicBuf, startAt.value, dur)
+  mpv.setSpec(makeDance(PV_FPS, startAt.value, dur, frames), mStyle.value, tplCfg(startAt.value))
+}
+/** Agrupa cambios seguidos (p. ej. al arrastrar el deslizador de inicio). `rebuild` = cambió el orden de las fotos: hay que reabrir la vista previa. */
+function mpvLater(audio: boolean, rebuild = false) {
+  if (!mpv) return
+  if (rebuild) { const was = mPlaying.value; stopMontagePreview(); if (was) void startMontagePreview(); return }
+  mpvA ||= audio; clearTimeout(mpvT); mpvT = window.setTimeout(() => { const a = mpvA; mpvA = false; mpvSync(a) }, 120)
+}
+async function mpvBg() {
+  const gen = mpvGen
+  try {
+    const id = bgId.value
+    for (const [i, p] of mpvPrep.entries()) {
+      if (!mpv || gen !== mpvGen) return
+      if (id === 'none' || !p.faces.length || (id === 'image' && !bgBmp.value)) { mpv.setBackground(i, undefined); continue }
+      if (!mpvMasks.has(i)) { status.value = `Separando a las personas del fondo… ${i + 1} de ${mpvPrep.length}`; await tick(); mpvMasks.set(i, refineMask(await segmentPerson(p.cv, p.faces[0][1]), p.cv)) }
+      if (!mpv || gen !== mpvGen) return
+      mpv.setBackground(i, id === 'image' ? { id, bitmap: await coverBitmap(bgBmp.value!, p.cv.width, p.cv.height) } : { id }, mpvMasks.get(i))
+    }
+    if (mpv && gen === mpvGen) status.value = 'Vista previa del montaje en vivo.'
+  } catch (e) { status.value = e instanceof Error ? e.message : String(e); if (bgId.value !== 'none') bgId.value = 'none' }
+}
+async function startMontagePreview() {
+  if (!mPhotos.value.length || busy.value || mPvBusy.value || mPreviewing.value) return
+  unlockAudio(); mPvBusy.value = true
+  try {
+    if (!spectral) { status.value = 'Analizando compases y secciones…'; await ensureStructure() }
+    const D = dimsFor(PV); status.value = 'Preparando las fotos…'; await tick()
+    const { prep, photos } = await mPrep(Math.round(Math.max(D.W, D.H) * 1.3), false)
+    const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
+    mpvPrep = prep; mpvMasks = new Map(); mpvGen++; mPreviewing.value = true; await nextTick()
+    mpv = new MontagePreview(mpCv.value!, { photos, ow: D.W, oh: D.H, fps: PV_FPS, dur, spec: makeDance(PV_FPS, startAt.value, dur, frames), style: mStyle.value, tpl: tplCfg(startAt.value), integrate: integrate.value })
+    mpv.setClip(musicBuf, startAt.value, dur); await mpvBg()
+    if (mpv) { mpv.play(); mPlaying.value = true; status.value = 'Vista previa del montaje en vivo: cambia estilo, música, BPM o fondo y se aplica al instante. Cuando te guste, pulsa Crear montaje.' }
+  } catch (e) { stopMontagePreview(); status.value = e instanceof Error ? e.message : String(e) } finally { mPvBusy.value = false }
+}
+function stopMontagePreview() { clearTimeout(mpvT); mpvA = false; mpvGen++; mpv?.dispose(); mpv = null; mpvPrep = []; mpvMasks = new Map(); mPreviewing.value = false; mPlaying.value = false }
+const mpvToggle = () => { mPlaying.value = mpv ? mpv.toggle() : false }
+watch([bpm, barShift, tpl, tplOn, tplGain, tplMirror, tplMode, mStyle], () => mpvLater(false)); watch(startAt, () => mpvLater(true)); watch(tier, () => mpvLater(true)); watch(integrate, v => mpv?.setIntegrate(v)); watch([bgId, bgBmp], () => { if (mpv) void mpvBg() })
 const caps = ref<Caps | null>(null), modelMb = ref<number | null>(null), mode = ref('')
 const capsLine = computed(() => { const c = caps.value; return c ? `Modo recomendado: ${tiers[c.tier].label}. ${c.cores} núcleos${c.memory ? ` · ~${c.memory} GB` : ''} · WebGPU ${c.webgpu ? 'disponible' : 'no disponible'} · SIMD ${c.simd ? 'sí' : 'no'}` : '' })
 const modelLine = computed(() => (modelMb.value ? `Modelo descargado: ${modelMb.value.toFixed(0)} MB · disponible offline` : 'El modelo facial se descargará la primera vez.'))
 onMounted(() => { if (dance.value) pickTrack(TRACKS[0], true); detectCaps().then(c => { caps.value = c; tier.value = c.tier; if (!c.ok) status.value = c.problems.join(' ') }); modelStatus().then(v => (modelMb.value = v)) })
-async function wipe() { if (!confirm('Se borrará el modelo descargado y la foto actual. ¿Continuar?')) return; clear(); clearVoice(); clearMusic(); bgBmp.value = null; bgId.value = 'none'; await clearLocalData(); modelMb.value = null; mode.value = ''; status.value = 'Datos locales borrados.' }
+async function wipe() { if (!confirm('Se borrará el modelo descargado y las fotos actuales. ¿Continuar?')) return; clear(); clearPhotos(); clearVoice(); clearMusic(); bgBmp.value = null; bgId.value = 'none'; await clearLocalData(); modelMb.value = null; mode.value = ''; status.value = 'Datos locales borrados.' }
 const crop = reactive({ zoom: 1, cx: 0, cy: 0, rot: 0 }), cv = ref<HTMLCanvasElement | null>(null)
 const pts = new Map<number, { x: number; y: number }>(); let pinch0 = 1, zoom0 = 1
 const gap = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1 }
@@ -291,13 +406,13 @@ async function startPreview() {
 }
 function stopPreview() { clearTimeout(pvT); pvA = false; pvRig = undefined; pv?.dispose(); pv = null; pvMask = undefined; pvSrc = null; pvL = null; previewing.value = false; pvPlaying.value = false }
 const pvToggle = () => { pvPlaying.value = pv ? pv.toggle() : false }
-const onHide = () => { if (document.hidden && pv?.isPlaying) { pv.pause(); pvPlaying.value = false } }
+const onHide = () => { if (!document.hidden) return; if (pv?.isPlaying) { pv.pause(); pvPlaying.value = false } if (mpv?.isPlaying) { mpv.pause(); mPlaying.value = false } }
 onMounted(() => document.addEventListener('visibilitychange', onHide))
-onBeforeUnmount(() => { document.removeEventListener('visibilitychange', onHide); stopPreview() })
+onBeforeUnmount(() => { document.removeEventListener('visibilitychange', onHide); stopPreview(); stopMontagePreview(); mPhotos.value.forEach(disposePhoto) })
 watch([bgId, bgBmp], () => { pvBg() }); watch(integrate, v => pv?.setIntegrate(v))
 watch([tpl, tplOn, tplGain, tplMirror, tplMode, tplArms], () => pvLater(false)); watch(startAt, () => pvLater(true)); watch(tier, () => pvLater(true)); watch([bpm, barShift], () => pvLater(false))
 watch(dance, v => { if (!v) stopPreview() })
-function setFmt(f: 'sq' | 'v') { if (fmt.value === f) return; stopPreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
+function setFmt(f: 'sq' | 'v') { if (fmt.value === f) return; stopPreview(); stopMontagePreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
 const fname = () => `foto-animada.${out.value!.ext}`
 function save() { const a = document.createElement('a'); a.href = videoUrl.value; a.download = fname(); a.click() }
 const share = () => navigator.share({ files: [new File([out.value!.blob], fname(), { type: out.value!.blob.type })] }).catch(() => {})
@@ -309,24 +424,38 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     <div v-if="caps" class="badge">{{ capsLine }}</div>
     <div class="badge">{{ modelLine }}</div>
     <div v-if="mode" class="badge">{{ mode }}</div>
+    <div class="row seg" role="group" aria-label="Modo"><button :class="{ on: !mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(false)">📷 Una foto</button><button :class="{ on: mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(true)">🎬 Montaje (varias fotos)</button></div>
     <div class="frame" :class="{ v: fmt === 'v' }">
-      <canvas v-if="previewing" ref="pvCv" class="pv" aria-label="Vista previa en vivo" />
+      <canvas v-if="mPreviewing" ref="mpCv" class="pv" aria-label="Vista previa del montaje" />
+      <canvas v-else-if="previewing" ref="pvCv" class="pv" aria-label="Vista previa en vivo" />
       <video v-else-if="videoUrl" :src="videoUrl" controls playsinline :loop="lastDance ? hasAudio : !speechText && !voiceUrl" :autoplay="!hasAudio" :muted="!hasAudio" @play="onPlay" @pause="onPause" />
+      <label v-else-if="mont && !mPhotos.length" class="empty">🎬<input type="file" accept="image/*,.heic" multiple hidden :disabled="mAdding" @change="addPhotos" /></label>
+      <div v-else-if="mont" class="thumbs"><figure v-for="(p, i) in mPhotos" :key="p.id"><img :src="p.url" :alt="p.name" /><figcaption>{{ i + 1 }} · {{ p.faces.length ? '👤'.repeat(p.faces.length) : 'sin rostro' }}</figcaption></figure></div>
       <canvas v-else-if="bitmap" ref="cv" :width="dimsFor(512).W" :height="dimsFor(512).H" aria-label="Encuadre de la fotografía" @pointerdown="down" @pointermove="move" @pointerup="up" @pointercancel="up" />
       <label v-else class="empty">📷<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
     </div>
-    <div class="row">
+    <div v-if="!mont" class="row">
       <label class="btn">Elegir fotografía<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
       <button v-if="photoUrl" @click="clear()">Quitar</button>
       <button v-if="videoUrl || previewing" @click="stopPreview(); clear(false)">Ajustar encuadre</button>
     </div>
-    <div v-if="bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop, AR)">↻ Girar</button></div>
+    <div v-if="!mont && bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop, AR)">↻ Girar</button></div>
     <div class="row seg" role="group" aria-label="Formato"><button :class="{ on: fmt === 'sq' }" :disabled="busy || pvBusy" @click="setFmt('sq')">Cuadrado 1:1</button><button :class="{ on: fmt === 'v' }" :disabled="busy || pvBusy" @click="setFmt('v')">Vertical 9:16</button></div>
-    <div v-if="dance && bitmap && musicName" class="row">
+    <div v-if="!mont && dance && bitmap && musicName" class="row">
       <button v-if="!previewing" :disabled="busy || pvBusy || analyzing" @click="startPreview">{{ pvBusy ? 'Preparando…' : '▶ Vista previa en vivo' }}</button>
       <template v-else><button @click="pvToggle">{{ pvPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopPreview">✕ Cerrar vista previa</button></template>
     </div>
-    <div class="row seg"><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button></div>
+    <div v-if="mont" class="bgs">
+      <div class="row"><label class="btn">{{ mPhotos.length ? '➕ Añadir fotos' : '📷 Elegir fotos' }}<input type="file" accept="image/*,.heic" multiple hidden :disabled="busy || mPvBusy || mAdding || mPhotos.length >= MAX_PHOTOS" @change="addPhotos" /></label><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="clearPhotos">Quitar todas</button><button v-if="videoUrl" @click="clear(false)">Volver a las fotos</button></div>
+      <div v-if="mPhotos.length" class="mlist"><div v-for="(p, i) in mPhotos" :key="p.id" class="mrow"><img :src="p.url" :alt="p.name" /><span>{{ i + 1 }} · {{ p.faces.length ? p.faces.length + (p.faces.length === 1 ? ' persona' : ' personas') : 'sin rostro' }}</span><button :disabled="busy || i === 0" aria-label="Subir" @click="movePhoto(i, -1)">◀</button><button :disabled="busy || i === mPhotos.length - 1" aria-label="Bajar" @click="movePhoto(i, 1)">▶</button><button :disabled="busy" aria-label="Quitar" @click="removePhoto(p.id)">✕</button></div></div>
+      <div class="row seg" role="group" aria-label="Estilo del montaje"><button v-for="s in STYLES" :key="s.id" :class="{ on: mStyle === s.id }" @click="mStyle = s.id">{{ s.label }}</button></div>
+      <div class="st">{{ mHint }}</div>
+      <div v-if="mPhotos.length && musicName" class="row">
+        <button v-if="!mPreviewing" :disabled="busy || mPvBusy || analyzing || mAdding" @click="startMontagePreview">{{ mPvBusy ? 'Preparando…' : '▶ Vista previa del montaje' }}</button>
+        <template v-else><button @click="mpvToggle">{{ mPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopMontagePreview">✕ Cerrar vista previa</button></template>
+      </div>
+    </div>
+    <div v-if="!mont" class="row seg"><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button></div>
     <template v-if="!dance">
       <label>¿Qué quieres que haga?
         <textarea v-model="prompt" placeholder="Que sonría, mire a la cámara y parpadee…" style="width:100%" /></label>
@@ -346,6 +475,7 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     </template>
     <div v-if="dance" class="bgs">
       <div class="st">🎬 Imitar un vídeo (plantilla de movimientos)</div>
+      <div v-if="mont" class="st">En el montaje la plantilla mueve cabeza y torso de cada persona (los brazos solo funcionan con una foto).</div>
       <div class="row">
         <label class="btn">{{ tpl ? '🎬 Otro vídeo' : '🎬 Vídeo a imitar' }}<input type="file" accept="video/*" hidden :disabled="busy || tplBusy" @change="pickRefVideo" /></label>
         <label class="btn">📂 Abrir plantilla<input type="file" accept=".json,application/json" hidden :disabled="busy || tplBusy" @change="loadTplFile" /></label>
@@ -374,11 +504,12 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <label v-if="bgId !== 'none'" class="st"><input type="checkbox" v-model="integrate" /> ✨ Luz y sombra del fondo sobre la persona</label>
     </div>
     <select v-model="tier"><option v-for="(t, k) in tiers" :key="k" :value="k">{{ tierLabel(k) }}</option></select>
-    <button class="go" :disabled="!bitmap || busy || analyzing || !!(caps && !caps.ok)" @click="generate">{{ busy ? 'Animando…' : 'Animar' }}</button>
+    <button v-if="mont" class="go" :disabled="!mPhotos.length || busy || analyzing || mAdding || !!(caps && !caps.ok)" @click="generateMontage">{{ busy ? 'Montando…' : '🎬 Crear montaje' }}</button>
+    <button v-else class="go" :disabled="!bitmap || busy || analyzing || !!(caps && !caps.ok)" @click="generate">{{ busy ? 'Animando…' : 'Animar' }}</button>
     <div v-if="busy" class="bar"><i :style="{ width: pct + '%' }" /></div>
     <div class="st" role="status">{{ status }}</div>
     <div v-if="diag" class="st" style="font-size:.72rem;opacity:.75;word-break:break-all">{{ diag }}</div>
-    <div v-if="videoUrl" class="row"><button :disabled="busy" @click="generate">Volver a generar</button><button @click="save">Guardar</button><button v-if="canShare" @click="share">Compartir</button></div>
+    <div v-if="videoUrl" class="row"><button :disabled="busy" @click="mont ? generateMontage() : generate()">Volver a generar</button><button @click="save">Guardar</button><button v-if="canShare" @click="share">Compartir</button></div>
     <DebugPanel v-if="debug && bitmap" :bitmap="bitmap" :crop="crop" :prompt="prompt" />
     <button class="lnk" @click="wipe">Borrar datos locales</button>
   </main>
@@ -386,5 +517,8 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
 <style scoped>
 .seg .on{background:var(--ink);color:#fff}.music{display:grid;gap:8px}.bpmrow{align-items:center}.bpmrow b{text-align:center;font-size:1.15rem;flex:1.6}
 .bgs{display:grid;gap:6px}.chips{display:flex;flex-wrap:wrap;gap:8px}.chips>*{flex:0 0 auto;padding:8px 12px}
+.thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(30%,1fr));gap:6px;padding:6px;width:100%;height:100%;overflow:auto;align-content:start}.thumbs figure{margin:0;position:relative;aspect-ratio:1}.thumbs img{width:100%;height:100%;object-fit:cover;border-radius:10px;display:block}
+.thumbs figcaption{position:absolute;left:4px;bottom:4px;background:rgba(0,0,0,.65);color:#fff;font-size:.7rem;border-radius:8px;padding:1px 6px}
+.mlist{display:grid;gap:6px}.mrow{display:flex;gap:6px;align-items:center}.mrow img{width:40px;height:40px;object-fit:cover;border-radius:8px}.mrow span{flex:1;font-size:.85rem}.mrow button{flex:0 0 auto;padding:6px 10px}
 .chip{color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.65)}.chips .on{outline:3px solid var(--acc);outline-offset:2px}
 </style>

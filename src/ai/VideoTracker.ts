@@ -7,7 +7,7 @@ import { dirAngle, wrapPi } from './ArmSkin'
 const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
 const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
 import { POSE_MODEL } from './BodyPose'
-export const TRACK_FPS = 24, TRACK_MAX_S = 20
+export const TRACK_FPS = 24, TRACK_MAX_S = 60
 
 export interface TrackResult { tpl: MotionTemplate; note: string }
 
