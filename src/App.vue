@@ -23,13 +23,27 @@ import { MontagePreview } from './rendering/MontagePreview'
 import { renderMontage } from './rendering/renderClient'
 import type { MPhoto, TplCfg } from './rendering/MontageRenderer'
 import type { Style } from './rendering/Montage'
-import { loadPhoto, prepare, disposePhoto, MAX_PHOTOS, type MPhotoRec } from './montage/photos'
-const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 60, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 60, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 60, label: 'Alta · 1024 px · 10 s' } }
+import { loadPhoto, loadVideo, restorePhoto, prepare, disposePhoto, scaled, MAX_PHOTOS, type MPhotoRec } from './montage/photos'
+import { planMontage, type PhotoInfo, type Plan, type Shot, type ShotEdit, type Trans } from './rendering/Montage'
+import { faceOf } from './ai/People'
+import { scaleFace } from './ai/MultiFace'
+import { reactiveFrom } from './audio/Reactive'
+import { defaultTitles, hasTitles, planTitles, type TitleCfg, type TitleFont } from './rendering/Titles'
+import { packProject, unpackProject, packFaces, unpackFaces, photoFile, frameFile, EXT, type Manifest, type ProjectPhoto, type ProjectSettings } from './montage/project'
+const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 60, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 60, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 60, label: 'Alta · 1024 px · 10 s' }, hd: { s: 1440, fps: 30, d: 10, dd: 60, label: 'Full HD · 1080p · 10 s' } }
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 // Formato de salida: cuadrado 1:1 o vertical 9:16 (redes). El vertical conserva el nº de píxeles de la talla elegida: 512→384×682, 768→576×1024, 1024→768×1366
-const fmt = ref<'sq' | 'v'>('sq'), AR = computed(() => (fmt.value === 'v' ? 9 / 16 : 1))
+type Fmt = 'sq' | 'v' | '45' | 'h'
+const FMTS: { id: Fmt; label: string; ar: number }[] = [{ id: 'sq', label: '1:1', ar: 1 }, { id: 'v', label: '9:16', ar: 9 / 16 }, { id: '45', label: '4:5', ar: 4 / 5 }, { id: 'h', label: '16:9', ar: 16 / 9 }]
+const fmt = ref<Fmt>('sq'), AR = computed(() => FMTS.find(f => f.id === fmt.value)!.ar)
+const frameStyle = computed(() => ({ aspectRatio: String(AR.value), ...(AR.value < 1 ? { width: `min(100%, calc(62vh * ${AR.value}))`, margin: '0 auto' } : {}) }))
+const HD: Record<Fmt, { W: number; H: number }> = { sq: { W: 1080, H: 1080 }, v: { W: 1080, H: 1920 }, '45': { W: 1080, H: 1350 }, h: { W: 1920, H: 1080 } }
+const outFmt = ref<'mp4' | 'webm' | 'gif'>('mp4'), GIF_MAX_S = 12, GIF_FPS = 15, GIF_LONG = 480
 const even = (n: number) => Math.round(n / 2) * 2
-const dimsFor = (s: number) => (fmt.value === 'v' ? (() => { const W = even(0.75 * s); return { W, H: even((W * 16) / 9) } })() : { W: s, H: s })
+/** Mismos píxeles totales en todos los formatos (el nivel de calidad manda); Full HD usa medidas de 1080p reales. */
+const dimsFor = (s: number) => { if (s === 1440) return HD[fmt.value]; const W = even(Math.sqrt(s * s * AR.value)); return { W, H: even(W / AR.value) } }
+/** Fotogramas por segundo y tamaño reales de la salida: el GIF va a 480 px y 15 fps. */
+const eff = () => { const T = tiers[tier.value], D = dimsFor(T.s); if (outFmt.value !== 'gif') return { fps: T.fps, D }; const k = Math.min(1, GIF_LONG / Math.max(D.W, D.H)); return { fps: GIF_FPS, D: { W: even(D.W * k), H: even(D.H * k) } } }
 const bitmap = ref<ImageBitmap | null>(null), photoUrl = ref(''), videoUrl = ref(''), out = ref<{ blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string } | null>(null)
 const recording = ref(false), voiceBuf = ref<AudioBuffer | null>(null), voiceUrl = ref(''), speechText = ref(''), hasAudio = ref(false)
 let rec: Awaited<ReturnType<typeof startRecording>> | null = null, aud: HTMLAudioElement | null = null
@@ -93,7 +107,7 @@ const danceMax = computed(() => tiers[tier.value].dd)
 const maxStart = computed(() => Math.max(0, musicDur.value - Math.min(danceMax.value, musicDur.value)))
 const danceDur = computed(() => Math.max(1, Math.min(danceMax.value, musicDur.value - startAt.value)))
 watch([tier, musicDur], () => { startAt.value = Math.min(startAt.value, maxStart.value) })
-const tierLabel = (k: keyof typeof tiers) => { const [name] = tiers[k].label.split(' · '), D = dimsFor(tiers[k].s); return `${name} · ${fmt.value === 'v' ? `${D.W}×${D.H}` : `${D.W} px`} · ${dance.value ? `hasta ${tiers[k].dd}` : tiers[k].d} s` }
+const tierLabel = (k: keyof typeof tiers) => { const [name] = tiers[k].label.split(' · '), D = dimsFor(tiers[k].s); return `${name} · ${fmt.value === 'sq' && k !== 'hd' ? `${D.W} px` : `${D.W}×${D.H}`} · ${dance.value ? `hasta ${tiers[k].dd}` : tiers[k].d} s` }
 const setBpm = (v: number) => { bpm.value = Math.min(240, Math.max(40, Math.round(v * 10) / 10)); barShift.value = 0 }
 function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null; enKey = ''; spectral = null; structP = null; barsKey = ''; g0Key = ''; barShift.value = 0; bars.value = null }
 /** Carga una canción (subida o incluida), la analiza y deja lista la edición. `known` = BPM exacto de las incluidas; `auto` = carga silenciosa al abrir la app. */
@@ -166,36 +180,42 @@ function saveTpl() {
   a.href = u; a.download = `${tpl.value.name || 'plantilla'}.movimiento.json`; a.click(); setTimeout(() => URL.revokeObjectURL(u), 2000)
 }
 function clearTpl() { tplCtl?.abort(); tpl.value = null; refFile.value = null; tplNote.value = '' }
-// ───────────── Montaje: varias fotos, todas las personas de cada foto, un único vídeo ─────────────
+// ───────────── Montaje: fotos y vídeos, todas las personas de cada foto, un único vídeo ─────────────
 const mont = ref(false), mPhotos = shallowRef<MPhotoRec[]>([]), mStyle = ref<Style>('dynamic'), mAdding = ref(false)
 const STYLES: { id: Style; label: string; hint: string }[] = [
   { id: 'soft', label: '🎞 Elegante', hint: 'Planos largos, cámara suave y transiciones limpias.' },
   { id: 'dynamic', label: '⚡ Dinámico', hint: 'Cortes al compás, un zoom con cada beat y destellos en los cambios de sección.' },
   { id: 'extreme', label: '💥 Explosivo', hint: 'Cortes muy rápidos, cámara que golpea, glitch RGB y sacudida en los drops.' }
 ]
-const mPeople = computed(() => mPhotos.value.reduce((n, p) => n + p.faces.length, 0))
-const mHint = computed(() => !mPhotos.value.length ? 'Elige entre 1 y ' + MAX_PHOTOS + ' fotos: cada persona que se vea baila a su manera y el montaje corta al ritmo de la música.' : `${mPhotos.value.length} foto${mPhotos.value.length > 1 ? 's' : ''} · ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'}. ${STYLES.find(x => x.id === mStyle.value)!.hint}`)
-const tick = () => new Promise(r => setTimeout(r, 30))
+const TRANS_OPTS: { id: Trans; label: string }[] = [{ id: 'cut', label: 'Corte' }, { id: 'zoom', label: 'Zoom' }, { id: 'whip', label: 'Barrido' }, { id: 'spin', label: 'Giro' }, { id: 'flash', label: 'Destello' }, { id: 'glitch', label: 'Glitch' }]
+const FONT_OPTS: { id: TitleFont; label: string }[] = [{ id: 'impact', label: 'Impacto' }, { id: 'modern', label: 'Moderna' }, { id: 'elegant', label: 'Elegante' }, { id: 'retro', label: 'Retro' }]
+const titles = ref<TitleCfg>(defaultTitles()), mTrans = ref<Trans[]>([]), mEdits = ref<Record<number, ShotEdit>>({}), reactOn = ref(true), mShots = shallowRef<Shot[]>([])
+const phrasesText = computed({ get: () => titles.value.phrases.join('\n'), set: (v: string) => { titles.value = { ...titles.value, phrases: v.split('\n') } } })
+const mPeople = computed(() => mPhotos.value.reduce((n, p) => n + p.faces.length, 0)), mVideos = computed(() => mPhotos.value.filter(p => p.kind === 'video').length)
+const mHint = computed(() => !mPhotos.value.length ? `Elige entre 1 y ${MAX_PHOTOS} fotos o vídeos cortos: cada persona que se vea baila a su manera y el montaje corta al ritmo de la música.` : `${mPhotos.value.length} elemento${mPhotos.value.length > 1 ? 's' : ''}${mVideos.value ? ` (${mVideos.value} vídeo${mVideos.value > 1 ? 's' : ''})` : ''} · ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'}. ${STYLES.find(x => x.id === mStyle.value)!.hint}`)
+const tick = () => new Promise(r => setTimeout(r, 30)), val = (e: Event) => (e.target as HTMLSelectElement).value, fmtT = (t: number) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`
 async function addPhotos(e: Event) {
   const input = e.target as HTMLInputElement, files = [...(input.files ?? [])]; input.value = ''; if (!files.length || mAdding.value) return
   stopMontagePreview(); clear(false); mAdding.value = true
   try {
-    const room = MAX_PHOTOS - mPhotos.value.length, take = files.slice(0, Math.max(0, room)), got: MPhotoRec[] = []; let bad = 0
+    const room = MAX_PHOTOS - mPhotos.value.length, take = files.slice(0, Math.max(0, room)), got: MPhotoRec[] = [], errs: string[] = []
     for (const [i, f] of take.entries()) {
-      status.value = `Buscando personas en la foto ${i + 1} de ${take.length}… (la primera vez se descarga el modelo)`; await tick()
-      try { got.push(await loadPhoto(f)) } catch { bad++ }
+      const vid = f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm)$/i.test(f.name), n = `${i + 1} de ${take.length}`
+      status.value = vid ? `Preparando el vídeo ${n}…` : `Buscando personas en la foto ${n}… (la primera vez se descarga el modelo)`; await tick()
+      try { got.push(vid ? await loadVideo(f, p => (status.value = `Preparando el vídeo ${n}… ${Math.round(p * 100)} %`)) : await loadPhoto(f)) } catch (err) { errs.push(vid && err instanceof Error ? err.message : `«${f.name}» no se pudo abrir (¿HEIC?; prueba JPG, PNG o WebP).`) }
     }
     mPhotos.value = [...mPhotos.value, ...got]
-    const none = got.filter(p => !p.faces.length).length
-    status.value = [got.length ? `${got.length} foto${got.length > 1 ? 's' : ''} añadida${got.length > 1 ? 's' : ''}.` : '', none ? `${none} sin rostro detectado: saldrá como imagen fija con cámara.` : '', bad ? `${bad} no se pudo abrir (¿HEIC?; prueba JPG, PNG o WebP).` : '', files.length > take.length ? `Máximo ${MAX_PHOTOS} fotos.` : ''].filter(Boolean).join(' ')
+    const none = got.filter(p => p.kind === 'image' && !p.faces.length).length
+    status.value = [got.length ? `${got.length} añadido${got.length > 1 ? 's' : ''}.` : '', none ? `${none} sin rostro detectado: saldrá como imagen fija con cámara.` : '', ...errs, files.length > take.length ? `Máximo ${MAX_PHOTOS}.` : ''].filter(Boolean).join(' ')
   } catch (err) { status.value = err instanceof Error ? err.message : String(err) } finally { mAdding.value = false }
 }
 function removePhoto(id: number) { stopMontagePreview(); clear(false); const r = mPhotos.value.find(p => p.id === id); if (r) disposePhoto(r); mPhotos.value = mPhotos.value.filter(p => p.id !== id) }
 function movePhoto(i: number, d: number) { const a = [...mPhotos.value], j = i + d; if (j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; mPhotos.value = a; mpvLater(false, true) }
-function clearPhotos() { stopMontagePreview(); clear(false); mPhotos.value.forEach(disposePhoto); mPhotos.value = [] }
+function toggleFav(id: number) { mPhotos.value = mPhotos.value.map(p => (p.id === id ? { ...p, fav: !p.fav } : p)) }
+function clearPhotos() { stopMontagePreview(); clear(false); mPhotos.value.forEach(disposePhoto); mPhotos.value = []; mEdits.value = {}; mShots.value = [] }
 function setMont(v: boolean) { if (v === mont.value) return; stopPreview(); stopMontagePreview(); clear(false); mont.value = v; if (v) dance.value = true; status.value = '' }
 const tplCfg = (t0: number): TplCfg | undefined => (tpl.value && tplOn.value ? { tpl: tpl.value, mode: tplMode.value, gain: tplGain.value, mirror: tplMirror.value, startAt: t0 } : undefined)
-/** Fotos preparadas para el motor al tamaño pedido; con fondo elegido, también el recorte de las personas de cada foto (si una falla, esa foto sale sin cambiar el fondo). */
+/** Elementos preparados para el motor al tamaño pedido; con fondo elegido, también el recorte de las personas de cada foto (si una falla, esa foto sale sin cambiar el fondo). */
 async function mPrep(long: number, withBg: boolean) {
   const prep: { cv: HTMLCanvasElement; faces: Pt[][] }[] = [], photos: MPhoto[] = [], id = bgId.value; let failed = ''
   for (const [i, r] of mPhotos.value.entries()) {
@@ -204,40 +224,78 @@ async function mPrep(long: number, withBg: boolean) {
       status.value = `Separando a las personas del fondo… ${i + 1} de ${mPhotos.value.length}`; await tick()
       try { mask = refineMask(await segmentPerson(p.cv, p.faces[0][1]), p.cv); bg = id === 'image' ? { id, bitmap: await coverBitmap(bgBmp.value!, p.cv.width, p.cv.height) } : { id } } catch (e) { failed = e instanceof Error ? e.message : String(e) }
     }
-    prep.push({ cv: p.cv, faces: p.faces }); photos.push({ src: p.src, faces: p.faces, bg, mask })
+    prep.push({ cv: p.cv, faces: p.faces }); photos.push({ src: p.src, faces: p.faces, bg, mask, video: r.kind === 'video' ? { frames: r.frames!, fps: r.vfps! } : undefined })
   }
   if (failed) status.value = failed
   return { prep, photos }
 }
 const closeAll = (ps: MPhoto[]) => ps.forEach(p => { p.src.close(); p.bg?.bitmap?.close() })
+/** Guion del montaje (planos + títulos) a partir de la música y los ajustes. Se calcula SIEMPRE con la rejilla de la vista previa, así las ediciones manuales caen en los mismos planos en el export. */
+function mkPlan(spec: DanceSpec, dur: number): Plan {
+  const rs = mPhotos.value, info: PhotoInfo[] = rs.map(r => ({ W: r.bmp.width, H: r.bmp.height, faces: r.faces.map(f => faceOf(scaleFace(f, r.bmp.width, r.bmp.height))) }))
+  const hits = reactOn.value && spec.bands ? reactiveFrom(spec.bands, spec.fps)?.hits : undefined
+  return planMontage({ photos: info, dur, bpm: spec.bpm, offset: spec.offset, bar0: spec.bar0, cuts: spec.cuts, energy: spec.energy, fps: spec.fps, style: mStyle.value, weights: rs.map(r => (r.fav ? 2 : 1)), hits, trans: mTrans.value, edits: mEdits.value })
+}
+function mCore() {
+  const t0 = startAt.value, cap = outFmt.value === 'gif' ? GIF_MAX_S : Infinity, pd = Math.max(1, Math.floor(Math.min(danceDur.value, cap) * PV_FPS)) / PV_FPS
+  const spec = makeDance(PV_FPS, t0, pd, Math.round(pd * PV_FPS)), plan = mkPlan(spec, pd)
+  const tt = hasTitles(titles.value) ? { cfg: titles.value, events: planTitles(titles.value, { dur: pd, bpm: spec.bpm, offset: spec.offset, bar0: spec.bar0, cuts: spec.cuts }) } : undefined
+  return { t0, pd, spec, plan, tt }
+}
+let mEditsSig = ''
+const sigOf = () => [bpm.value, startAt.value, barShift.value, mStyle.value, mTrans.value.join(), mPhotos.value.map(p => p.id + (p.fav ? 'f' : '')).join(), danceDur.value, reactOn.value, outFmt.value === 'gif'].join('|')
+function refreshShots() {
+  if (!mont.value || !musicBuf || !spectral || bpm.value <= 0 || !mPhotos.value.length) { mShots.value = []; return }
+  const sig = sigOf(); if (sig !== mEditsSig) { if (Object.keys(mEdits.value).length) { mEdits.value = {}; status.value = 'El guion se ha recalculado: se han descartado tus cambios manuales de planos.' } mEditsSig = sig }
+  mShots.value = mCore().plan.shots
+}
+async function showScript() { if (!musicBuf) return; if (!spectral) { status.value = 'Analizando compases y secciones…'; await tick(); await ensureStructure(); status.value = '' } refreshShots() }
+const toggleTrans = (t: Trans) => { mTrans.value = mTrans.value.includes(t) ? mTrans.value.filter(x => x !== t) : [...mTrans.value, t] }
+const planoKey = (s: Shot) => (s.kind === 'face' ? `face:${s.focus[0]}` : s.kind === 'pair' ? `pair:${s.focus[0]}-${s.focus[1]}` : s.kind)
+function planoOpts(photo: number) {
+  const r = mPhotos.value[photo], n = r?.faces.length ?? 0, o = [{ v: 'wide', l: 'Plano general' }]
+  for (let i = 0; i < n; i++) o.push({ v: `face:${i}`, l: n > 1 ? `Cara ${i + 1}` : 'Primer plano' })
+  for (let i = 0; i < n - 1; i++) o.push({ v: `pair:${i}-${i + 1}`, l: `Caras ${i + 1}-${i + 2}` })
+  if (n) o.push({ v: 'detail', l: 'Primerísimo' }); return o
+}
+function setEdits(p: Record<number, ShotEdit>) { const n = { ...mEdits.value }; for (const [k, v] of Object.entries(p)) n[+k] = { ...n[+k], ...v }; mEdits.value = n }
+function onPlano(k: number, v: string) {
+  const [kind, rest] = v.split(':'), r = mPhotos.value[mShots.value[k].photo]
+  if (kind === 'face') setEdits({ [k]: { kind: 'face', focus: [+rest] } })
+  else if (kind === 'pair') setEdits({ [k]: { kind: 'pair', focus: rest.split('-').map(Number) } })
+  else if (kind === 'detail') { let big = 0; const w = (f: Pt[]) => Math.hypot(f[454].x - f[234].x, f[454].y - f[234].y); r?.faces.forEach((f, i) => { if (w(f) > w(r.faces[big])) big = i }); setEdits({ [k]: { kind: 'detail', focus: [big] } }) }
+  else setEdits({ [k]: { kind: 'wide', focus: [] } })
+}
+function swapShots(k: number, d: number) { const a = mShots.value[k], b = mShots.value[k + d]; if (!a || !b) return; const c = (s: Shot): ShotEdit => ({ photo: s.photo, kind: s.kind, focus: [...s.focus] }); setEdits({ [k]: c(b), [k + d]: c(a) }) }
+const resetEdits = () => { mEdits.value = {} }
+function seekShot(k: number) { mpv?.seek(mShots.value[k].t0 + 0.05) }
 async function generateMontage() {
   if (!mPhotos.value.length || busy.value) return
   if (!musicBuf) { status.value = 'Sube primero la música con la que quieres que bailen.'; return }
   if (bgId.value === 'image' && !bgBmp.value) { status.value = 'Elige una imagen para el fondo o selecciona otro fondo.'; return }
   busy.value = true; stopMontagePreview(); clear(false); let photos: MPhoto[] = []
   try {
-    const T = tiers[tier.value], D = dimsFor(T.s), long = Math.min(1800, Math.round(Math.max(D.W, D.H) * 1.35))
+    const E = eff(), T = { ...tiers[tier.value], fps: E.fps }, D = E.D, long = Math.min(2200, Math.round(Math.max(D.W, D.H) * 1.3))
     status.value = 'Preparando las fotos…'; await tick()
     photos = (await mPrep(long, true)).photos
-    const sr = musicBuf.sampleRate, frames = Math.floor(danceDur.value * T.fps), dur = frames / T.fps, t0 = startAt.value
     if (!spectral) { status.value = 'Analizando compases y secciones…'; await tick(); await ensureStructure() }
-    const spec = makeDance(T.fps, t0, dur, frames)
+    const c = mCore(), sr = musicBuf.sampleRate, frames = Math.floor(c.pd * T.fps), dur = frames / T.fps, t0 = c.t0, spec = makeDance(T.fps, t0, dur, frames), gif = outFmt.value === 'gif'
     playUrl.value = musicUrl.value; playFrom = t0; aud = null; lastDance.value = true; speechText.value = ''
     status.value = 'Montando el vídeo…'
-    const res = await renderMontage({ photos, ow: D.W, oh: D.H, fps: T.fps, dur, spec, style: mStyle.value, tpl: tplCfg(t0), integrate: integrate.value, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr } }, p => (pct.value = Math.round(p * 100)))
-    out.value = res.out; mode.value = `En uso: montaje · render ${res.where === 'worker' ? 'en worker' : 'en hilo principal'} · ${res.out.ext.toUpperCase()}`
+    const res = await renderMontage({ photos, ow: D.W, oh: D.H, fps: T.fps, dur, spec, style: mStyle.value, plan: c.plan, titles: c.tt, react: reactOn.value, tpl: tplCfg(t0), integrate: integrate.value, out: outFmt.value, audio: gif ? undefined : { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr } }, p => (pct.value = Math.round(p * 100)))
+    out.value = res.out; mode.value = `En uso: montaje · render ${res.where === 'worker' ? 'en worker' : 'en hilo principal'} · ${res.out.ext.toUpperCase()} ${D.W}×${D.H}`
     hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); diagBase = `build ${BUILD} · ${out.value.audioInfo ? 'audio ' + out.value.audioInfo : 'audio: no codificado'}`; diag.value = diagBase
-    status.value = hasAudio.value ? `Listo: montaje de ${mPhotos.value.length} foto${mPhotos.value.length > 1 ? 's' : ''} y ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'} a ${bpm.value} BPM.` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + (out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : '')
+    const sz = `${(res.out.blob.size / 1048576).toFixed(1)} MB`
+    status.value = gif ? `Listo: GIF de ${dur.toFixed(0)} s (${D.W}×${D.H}, ${sz}), sin sonido.` : hasAudio.value ? `Listo: montaje de ${mPhotos.value.length} elemento${mPhotos.value.length > 1 ? 's' : ''} y ${mPeople.value} persona${mPeople.value === 1 ? '' : 's'} a ${bpm.value} BPM (${res.out.ext.toUpperCase()} ${D.W}×${D.H}, ${sz}).` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + (out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : '')
   } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { closeAll(photos); busy.value = false }
 }
-// Vista previa en vivo del montaje (mismo motor que el export, a 512 px)
+// Vista previa en vivo del montaje (mismo motor y mismo guion que el export, a 512 px)
 const mpCv = ref<HTMLCanvasElement | null>(null), mPreviewing = ref(false), mPvBusy = ref(false), mPlaying = ref(false)
 let mpv: MontagePreview | null = null, mpvT = 0, mpvA = false, mpvPrep: { cv: HTMLCanvasElement; faces: Pt[][] }[] = [], mpvMasks = new Map<number, Mask>(), mpvGen = 0
 function mpvSync(audio: boolean) {
   if (!mpv || !musicBuf || bpm.value <= 0) return
-  const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
-  if (audio) mpv.setClip(musicBuf, startAt.value, dur)
-  mpv.setSpec(makeDance(PV_FPS, startAt.value, dur, frames), mStyle.value, tplCfg(startAt.value))
+  const c = mCore(); if (audio) mpv.setClip(musicBuf, c.t0, c.pd)
+  mpv.setSpec(c.spec, mStyle.value, tplCfg(c.t0), c.plan, c.tt, reactOn.value)
 }
 /** Agrupa cambios seguidos (p. ej. al arrastrar el deslizador de inicio). `rebuild` = cambió el orden de las fotos: hay que reabrir la vista previa. */
 function mpvLater(audio: boolean, rebuild = false) {
@@ -265,17 +323,66 @@ async function startMontagePreview() {
   try {
     if (!spectral) { status.value = 'Analizando compases y secciones…'; await ensureStructure() }
     const D = dimsFor(PV); status.value = 'Preparando las fotos…'; await tick()
-    const { prep, photos } = await mPrep(Math.round(Math.max(D.W, D.H) * 1.3), false)
-    const frames = Math.max(1, Math.floor(danceDur.value * PV_FPS)), dur = frames / PV_FPS
-    mpvPrep = prep; mpvMasks = new Map(); mpvGen++; mPreviewing.value = true; await nextTick()
-    mpv = new MontagePreview(mpCv.value!, { photos, ow: D.W, oh: D.H, fps: PV_FPS, dur, spec: makeDance(PV_FPS, startAt.value, dur, frames), style: mStyle.value, tpl: tplCfg(startAt.value), integrate: integrate.value })
-    mpv.setClip(musicBuf, startAt.value, dur); await mpvBg()
-    if (mpv) { mpv.play(); mPlaying.value = true; status.value = 'Vista previa del montaje en vivo: cambia estilo, música, BPM o fondo y se aplica al instante. Cuando te guste, pulsa Crear montaje.' }
+    const { prep, photos } = await mPrep(Math.round(Math.max(D.W, D.H) * 1.3), false), c = mCore()
+    mpvPrep = prep; mpvMasks = new Map(); mpvGen++; mPreviewing.value = true; await nextTick(); refreshShots()
+    mpv = new MontagePreview(mpCv.value!, { photos, ow: D.W, oh: D.H, fps: PV_FPS, dur: c.pd, spec: c.spec, style: mStyle.value, plan: c.plan, titles: c.tt, react: reactOn.value, tpl: tplCfg(c.t0), integrate: integrate.value })
+    mpv.setClip(musicBuf, c.t0, c.pd); await mpvBg()
+    if (mpv) { mpv.play(); mPlaying.value = true; status.value = 'Vista previa del montaje en vivo: cambia estilo, títulos, guion, música, BPM o fondo y se aplica al instante. Cuando te guste, pulsa Crear montaje.' }
   } catch (e) { stopMontagePreview(); status.value = e instanceof Error ? e.message : String(e) } finally { mPvBusy.value = false }
 }
 function stopMontagePreview() { clearTimeout(mpvT); mpvA = false; mpvGen++; mpv?.dispose(); mpv = null; mpvPrep = []; mpvMasks = new Map(); mPreviewing.value = false; mPlaying.value = false }
 const mpvToggle = () => { mPlaying.value = mpv ? mpv.toggle() : false }
-watch([bpm, barShift, tpl, tplOn, tplGain, tplMirror, tplMode, mStyle], () => mpvLater(false)); watch(startAt, () => mpvLater(true)); watch(tier, () => mpvLater(true)); watch(integrate, v => mpv?.setIntegrate(v)); watch([bgId, bgBmp], () => { if (mpv) void mpvBg() })
+watch([bpm, barShift, tpl, tplOn, tplGain, tplMirror, tplMode, mStyle, mTrans, mEdits, reactOn, mPhotos], () => mpvLater(false)); watch(titles, () => mpvLater(false), { deep: true }); watch(startAt, () => mpvLater(true)); watch(tier, () => mpvLater(true)); watch(outFmt, () => mpvLater(true)); watch(integrate, v => mpv?.setIntegrate(v)); watch([bgId, bgBmp], () => { if (mpv) void mpvBg() })
+watch([bpm, startAt, barShift, mStyle, mTrans, mPhotos, danceDur, reactOn, outFmt, mont, mEdits], refreshShots)
+// ───────────── Proyecto: guardar y retomar (fotos, vídeos, guion, títulos y ajustes; la música se vuelve a elegir) ─────────────
+const bgJpeg = (b: ImageBitmap) => new Promise<Blob>((res, rej) => scaled(b, 1600).toBlob(x => (x ? res(x) : rej(new Error('No se pudo guardar el fondo.'))), 'image/jpeg', 0.9))
+async function saveProject() {
+  if (!mPhotos.value.length) return
+  try {
+    status.value = 'Guardando el proyecto…'; await tick()
+    const files: Record<string, Uint8Array> = {}, photos: ProjectPhoto[] = [], bytes = async (b: Blob) => new Uint8Array(await b.arrayBuffer())
+    for (const [i, r] of mPhotos.value.entries()) {
+      files[photoFile(i)] = await bytes(r.blob)
+      if (r.kind === 'video') for (const [n, f] of r.frames!.entries()) files[frameFile(i, n)] = await bytes(f)
+      photos.push({ name: r.name, kind: r.kind, fav: r.fav, faces: packFaces(r.faces), ...(r.kind === 'video' ? { frames: r.frames!.length, vfps: r.vfps } : {}) })
+    }
+    const hasBg = bgId.value === 'image' && !!bgBmp.value; if (hasBg) files['bg.jpg'] = await bytes(await bgJpeg(bgBmp.value!))
+    const m: Manifest = { v: 1, app: 'foto-animada-montaje', saved: new Date().toISOString(), hasBg, photos, settings: { fmt: fmt.value, tier: tier.value, outFmt: outFmt.value, style: mStyle.value, titles: titles.value, trans: mTrans.value, edits: mEdits.value, bgId: bgId.value, integrate: integrate.value, react: reactOn.value, track: selTrack.value, musicName: musicName.value, startAt: startAt.value, tpl: tpl.value ? { on: tplOn.value, mode: tplMode.value, gain: tplGain.value, mirror: tplMirror.value, json: serializeTemplate(tpl.value) } : undefined } }
+    const blob = new Blob([packProject(m, files) as BlobPart], { type: 'application/zip' }), a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `montaje-${new Date().toISOString().slice(0, 10)}${EXT}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000)
+    status.value = `Proyecto guardado (${(blob.size / 1048576).toFixed(1)} MB). Ábrelo cuando quieras con «Abrir proyecto»; la música no va dentro.`
+  } catch (e) { status.value = e instanceof Error ? e.message : String(e) }
+}
+const HEX = /^#[0-9a-f]{6}$/i, isTrans = (x: unknown): x is Trans => TRANS_OPTS.some(t => t.id === x), KINDS = ['wide', 'face', 'pair', 'detail']
+function cleanEdits(x: unknown): Record<number, ShotEdit> {
+  const o: Record<number, ShotEdit> = {}; if (!x || typeof x !== 'object') return o
+  for (const [k, v] of Object.entries(x as Record<string, any>)) { if (!(+k >= 0) || !v || typeof v !== 'object') continue; o[+k] = { ...(Number.isInteger(v.photo) ? { photo: v.photo } : {}), ...(KINDS.includes(v.kind) ? { kind: v.kind, focus: Array.isArray(v.focus) ? v.focus.filter(Number.isInteger) : [] } : {}), ...(isTrans(v.trans) ? { trans: v.trans } : {}) } }
+  return o
+}
+async function openProject(e: Event) {
+  const input = e.target as HTMLInputElement, f = input.files?.[0]; input.value = ''; if (!f || busy.value || mAdding.value) return
+  mAdding.value = true; status.value = 'Abriendo el proyecto…'; await tick()
+  try {
+    const { manifest: m, files } = unpackProject(new Uint8Array(await f.arrayBuffer())), recs: MPhotoRec[] = []
+    for (const [i, p] of m.photos.entries()) recs.push(await restorePhoto({ name: String(p.name ?? ''), kind: p.kind === 'video' ? 'video' : 'image', fav: !!p.fav, faces: unpackFaces(p.faces), blob: new Blob([files[photoFile(i)] as BlobPart], { type: 'image/jpeg' }), vfps: p.vfps, frames: p.kind === 'video' ? Array.from({ length: p.frames! }, (_, n) => new Blob([files[frameFile(i, n)] as BlobPart], { type: 'image/jpeg' })) : undefined }))
+    stopPreview(); clearPhotos(); mPhotos.value = recs
+    const s = m.settings as ProjectSettings & Record<string, any>
+    if (FMTS.some(x => x.id === s.fmt)) fmt.value = s.fmt as Fmt
+    if (s.tier in tiers) tier.value = s.tier as keyof typeof tiers
+    if (['mp4', 'webm', 'gif'].includes(s.outFmt)) outFmt.value = s.outFmt as typeof outFmt.value
+    if (STYLES.some(x => x.id === s.style)) mStyle.value = s.style as Style
+    const t = (s.titles ?? {}) as Partial<TitleCfg>, d = defaultTitles()
+    titles.value = { intro: String(t.intro ?? ''), sub: String(t.sub ?? ''), outro: String(t.outro ?? ''), phrases: Array.isArray(t.phrases) ? t.phrases.map(String) : [], font: FONT_OPTS.some(x => x.id === t.font) ? t.font! : d.font, color: HEX.test(String(t.color)) ? t.color! : d.color, accent: HEX.test(String(t.accent)) ? t.accent! : d.accent, pos: ['center', 'bottom', 'top'].includes(String(t.pos)) ? t.pos! : d.pos }
+    mTrans.value = (Array.isArray(s.trans) ? s.trans : []).filter(isTrans); integrate.value = s.integrate !== false; reactOn.value = s.react !== false
+    bgBmp.value = m.hasBg ? await createImageBitmap(new Blob([files['bg.jpg'] as BlobPart], { type: 'image/jpeg' })) : null
+    bgId.value = s.bgId === 'image' ? (bgBmp.value ? 'image' : 'none') : s.bgId === 'none' || BG_UI.some(b => b.id === s.bgId) ? (s.bgId as BgId | 'none') : 'none'
+    if (s.tpl?.json) { try { tpl.value = parseTemplate(s.tpl.json); tplOn.value = s.tpl.on !== false; tplMode.value = s.tpl.mode as SyncMode; tplGain.value = Number(s.tpl.gain) || 1; tplMirror.value = !!s.tpl.mirror; tplNote.value = `${tpl.value.dur.toFixed(1)} s` } catch { /* plantilla ilegible: se ignora */ } }
+    mont.value = true; dance.value = true
+    const tr = TRACKS.find(x => x.id === s.track)
+    if (tr) { await pickTrack(tr); startAt.value = Math.max(0, Math.min(maxStart.value, Number(s.startAt) || 0)) }
+    await showScript(); mEditsSig = sigOf(); mEdits.value = cleanEdits(s.edits); await nextTick(); refreshShots()
+    status.value = `Proyecto abierto: ${recs.length} elemento${recs.length > 1 ? 's' : ''}.${tr ? '' : ` Elige de nuevo la canción${s.musicName ? ` «${s.musicName}»` : ''} (o otra) y se aplicará el guion.`}`
+  } catch (err) { status.value = err instanceof Error ? err.message : String(err) } finally { mAdding.value = false }
+}
 const caps = ref<Caps | null>(null), modelMb = ref<number | null>(null), mode = ref('')
 const capsLine = computed(() => { const c = caps.value; return c ? `Modo recomendado: ${tiers[c.tier].label}. ${c.cores} núcleos${c.memory ? ` · ~${c.memory} GB` : ''} · WebGPU ${c.webgpu ? 'disponible' : 'no disponible'} · SIMD ${c.simd ? 'sí' : 'no'}` : '' })
 const modelLine = computed(() => (modelMb.value ? `Modelo descargado: ${modelMb.value.toFixed(0)} MB · disponible offline` : 'El modelo facial se descargará la primera vez.'))
@@ -323,7 +430,7 @@ async function generate() {
   if (bgId.value === 'image' && !bgBmp.value) { status.value = 'Elige una imagen para el fondo o selecciona otro fondo.'; return }
   busy.value = true; stopPreview(); clear(false)
   try {
-    const T = tiers[tier.value], D = dimsFor(T.s), src = drawCrop(bm, crop, D.W, D.H)
+    const E = eff(), T = { ...tiers[tier.value], fps: E.fps }, D = E.D, src = drawCrop(bm, crop, D.W, D.H)
     status.value = 'Analizando rostro…'; await new Promise(r => setTimeout(r, 30))
     const L = await detect(src); if (!L) throw new Error('No detecto ningún rostro. Usa una foto frontal y bien iluminada.')
     let bg: BgSpec | undefined, mask: Mask | undefined
@@ -337,11 +444,11 @@ async function generate() {
     const input = await createImageBitmap(src); let job: Parameters<typeof renderVideo>[0], buf: AudioBuffer | null = null, ins = parseInstruction('', T.d)
     speechText.value = ''
     if (dance.value) {
-      const sr = musicBuf!.sampleRate, frames = Math.floor(danceDur.value * T.fps), dur = frames / T.fps, t0 = startAt.value
+      const sr = musicBuf!.sampleRate, frames = Math.floor(Math.min(danceDur.value, outFmt.value === 'gif' ? GIF_MAX_S : Infinity) * T.fps), dur = frames / T.fps, t0 = startAt.value
       if (!spectral) { status.value = 'Analizando compases y secciones…'; await new Promise(r => setTimeout(r, 30)); await ensureStructure() }
       const spec = makeDance(T.fps, t0, dur, frames)
       ins = { duration: dur, eyeMovement: 'camera', intensity: 0.65 }
-      job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, tpl: tplPlay(L, D.W, D.H, spec, t0, rig) ?? undefined, bg, mask, integrate: integrate.value }
+      job = { src: input, lm: L, ins, dur, fps: T.fps, audio: { mono: musicMono!.slice(Math.round(t0 * sr), Math.round((t0 + dur) * sr)), sampleRate: sr }, dance: spec, tpl: tplPlay(L, D.W, D.H, spec, t0, rig) ?? undefined, bg, mask, integrate: integrate.value, out: outFmt.value }
       playUrl.value = musicUrl.value; playFrom = t0; aud = null
     } else {
       buf = voiceBuf.value
@@ -349,7 +456,7 @@ async function generate() {
       if (buf) vis = audioVisemes(buf, T.fps, dur)
       else if (ins.speech) { speechText.value = ins.speech; vis = textVisemes(ins.speech, T.fps, dur) }
       const audio = buf ? { mono: toMono(buf), sampleRate: buf.sampleRate } : undefined
-      job = { src: input, lm: L, ins, vis, dur, fps: T.fps, audio, bg, mask }
+      job = { src: input, lm: L, ins, vis, dur, fps: T.fps, audio, bg, mask, out: outFmt.value }
       playUrl.value = voiceUrl.value; playFrom = 0
     }
     lastDance.value = dance.value
@@ -359,7 +466,7 @@ async function generate() {
     modelStatus().then(v => (modelMb.value = v))
     hasAudio.value = out.value.audio; videoUrl.value = URL.createObjectURL(out.value.blob); diagBase = `build ${BUILD} · ${out.value.audioInfo ? 'audio ' + out.value.audioInfo : 'audio: no codificado'}`; diag.value = diagBase
     const why = out.value.audioNote ? ` Motivo: ${out.value.audioNote}.` : ''
-    status.value = dance.value ? (hasAudio.value ? `Listo: ${job.tpl ? `imita «${tpl.value!.name}» y baila` : 'baila'} a ${bpm.value} BPM con tu música.${job.tpl ? rigNote(rig) : ''}` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
+    status.value = outFmt.value === 'gif' ? `Listo: GIF de ${dur0(job)} s (${D.W}×${D.H}, ${(res.out.blob.size / 1048576).toFixed(1)} MB), sin sonido.` : dance.value ? (hasAudio.value ? `Listo: ${job.tpl ? `imita «${tpl.value!.name}» y baila` : 'baila'} a ${bpm.value} BPM con tu música.${job.tpl ? rigNote(rig) : ''}` : 'Listo. Este dispositivo no mezcla audio en el vídeo: la música suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : buf ? (hasAudio.value ? 'Listo, con tu voz.' : 'Listo. Este dispositivo no mezcla audio en el vídeo: tu voz suena aparte en la vista previa y el archivo sale sin audio.' + why)
       : ins.speech ? 'Listo. La voz del texto solo suena en la vista previa (el navegador no deja capturarla): el archivo sale sin audio. Para llevar voz en el archivo, graba la tuya.' : 'Listo.'
   } catch (e) { status.value = e instanceof Error ? e.message : String(e) } finally { busy.value = false }
@@ -412,8 +519,9 @@ onBeforeUnmount(() => { document.removeEventListener('visibilitychange', onHide)
 watch([bgId, bgBmp], () => { pvBg() }); watch(integrate, v => pv?.setIntegrate(v))
 watch([tpl, tplOn, tplGain, tplMirror, tplMode, tplArms], () => pvLater(false)); watch(startAt, () => pvLater(true)); watch(tier, () => pvLater(true)); watch([bpm, barShift], () => pvLater(false))
 watch(dance, v => { if (!v) stopPreview() })
-function setFmt(f: 'sq' | 'v') { if (fmt.value === f) return; stopPreview(); stopMontagePreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
+function setFmt(f: Fmt) { if (fmt.value === f) return; stopPreview(); stopMontagePreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
 const fname = () => `foto-animada.${out.value!.ext}`
+const dur0 = (j: { dur: number }) => j.dur.toFixed(0)
 function save() { const a = document.createElement('a'); a.href = videoUrl.value; a.download = fname(); a.click() }
 const share = () => navigator.share({ files: [new File([out.value!.blob], fname(), { type: out.value!.blob.type })] }).catch(() => {})
 </script>
@@ -425,11 +533,12 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     <div class="badge">{{ modelLine }}</div>
     <div v-if="mode" class="badge">{{ mode }}</div>
     <div class="row seg" role="group" aria-label="Modo"><button :class="{ on: !mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(false)">📷 Una foto</button><button :class="{ on: mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(true)">🎬 Montaje (varias fotos)</button></div>
-    <div class="frame" :class="{ v: fmt === 'v' }">
+    <div class="frame" :style="frameStyle">
       <canvas v-if="mPreviewing" ref="mpCv" class="pv" aria-label="Vista previa del montaje" />
       <canvas v-else-if="previewing" ref="pvCv" class="pv" aria-label="Vista previa en vivo" />
+      <img v-else-if="videoUrl && out?.ext === 'gif'" :src="videoUrl" alt="GIF generado" />
       <video v-else-if="videoUrl" :src="videoUrl" controls playsinline :loop="lastDance ? hasAudio : !speechText && !voiceUrl" :autoplay="!hasAudio" :muted="!hasAudio" @play="onPlay" @pause="onPause" />
-      <label v-else-if="mont && !mPhotos.length" class="empty">🎬<input type="file" accept="image/*,.heic" multiple hidden :disabled="mAdding" @change="addPhotos" /></label>
+      <label v-else-if="mont && !mPhotos.length" class="empty">🎬<input type="file" accept="image/*,.heic,video/*" multiple hidden :disabled="mAdding" @change="addPhotos" /></label>
       <div v-else-if="mont" class="thumbs"><figure v-for="(p, i) in mPhotos" :key="p.id"><img :src="p.url" :alt="p.name" /><figcaption>{{ i + 1 }} · {{ p.faces.length ? '👤'.repeat(p.faces.length) : 'sin rostro' }}</figcaption></figure></div>
       <canvas v-else-if="bitmap" ref="cv" :width="dimsFor(512).W" :height="dimsFor(512).H" aria-label="Encuadre de la fotografía" @pointerdown="down" @pointermove="move" @pointerup="up" @pointercancel="up" />
       <label v-else class="empty">📷<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
@@ -440,16 +549,44 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <button v-if="videoUrl || previewing" @click="stopPreview(); clear(false)">Ajustar encuadre</button>
     </div>
     <div v-if="!mont && bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop, AR)">↻ Girar</button></div>
-    <div class="row seg" role="group" aria-label="Formato"><button :class="{ on: fmt === 'sq' }" :disabled="busy || pvBusy" @click="setFmt('sq')">Cuadrado 1:1</button><button :class="{ on: fmt === 'v' }" :disabled="busy || pvBusy" @click="setFmt('v')">Vertical 9:16</button></div>
+    <div class="row seg" role="group" aria-label="Formato"><button v-for="f in FMTS" :key="f.id" :class="{ on: fmt === f.id }" :disabled="busy || pvBusy || mPvBusy" @click="setFmt(f.id)">{{ f.label }}</button></div>
     <div v-if="!mont && dance && bitmap && musicName" class="row">
       <button v-if="!previewing" :disabled="busy || pvBusy || analyzing" @click="startPreview">{{ pvBusy ? 'Preparando…' : '▶ Vista previa en vivo' }}</button>
       <template v-else><button @click="pvToggle">{{ pvPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopPreview">✕ Cerrar vista previa</button></template>
     </div>
     <div v-if="mont" class="bgs">
-      <div class="row"><label class="btn">{{ mPhotos.length ? '➕ Añadir fotos' : '📷 Elegir fotos' }}<input type="file" accept="image/*,.heic" multiple hidden :disabled="busy || mPvBusy || mAdding || mPhotos.length >= MAX_PHOTOS" @change="addPhotos" /></label><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="clearPhotos">Quitar todas</button><button v-if="videoUrl" @click="clear(false)">Volver a las fotos</button></div>
-      <div v-if="mPhotos.length" class="mlist"><div v-for="(p, i) in mPhotos" :key="p.id" class="mrow"><img :src="p.url" :alt="p.name" /><span>{{ i + 1 }} · {{ p.faces.length ? p.faces.length + (p.faces.length === 1 ? ' persona' : ' personas') : 'sin rostro' }}</span><button :disabled="busy || i === 0" aria-label="Subir" @click="movePhoto(i, -1)">◀</button><button :disabled="busy || i === mPhotos.length - 1" aria-label="Bajar" @click="movePhoto(i, 1)">▶</button><button :disabled="busy" aria-label="Quitar" @click="removePhoto(p.id)">✕</button></div></div>
+      <div class="row"><label class="btn">{{ mPhotos.length ? '➕ Añadir' : '📷 Fotos o vídeos' }}<input type="file" accept="image/*,.heic,video/*" multiple hidden :disabled="busy || mPvBusy || mAdding || mPhotos.length >= MAX_PHOTOS" @change="addPhotos" /></label><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="clearPhotos">Quitar todas</button><button v-if="videoUrl" @click="clear(false)">Volver a las fotos</button></div>
+      <div class="row"><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="saveProject">💾 Guardar proyecto</button><label class="btn">📂 Abrir proyecto<input type="file" :accept="EXT + ',application/zip'" hidden :disabled="busy || mPvBusy || mAdding" @change="openProject" /></label></div>
+      <div v-if="mPhotos.length" class="mlist"><div v-for="(p, i) in mPhotos" :key="p.id" class="mrow"><img :src="p.url" :alt="p.name" /><span>{{ i + 1 }} · {{ p.kind === 'video' ? '🎞 vídeo' : p.faces.length ? p.faces.length + (p.faces.length === 1 ? ' persona' : ' personas') : 'sin rostro' }}</span><button :class="{ on: p.fav }" :disabled="busy" :aria-label="p.fav ? 'Quitar de favoritas' : 'Marcar favorita'" :title="p.fav ? 'Favorita: sale el doble de veces' : 'Marcar como favorita'" @click="toggleFav(p.id)">{{ p.fav ? '⭐' : '☆' }}</button><button :disabled="busy || i === 0" aria-label="Subir" @click="movePhoto(i, -1)">◀</button><button :disabled="busy || i === mPhotos.length - 1" aria-label="Bajar" @click="movePhoto(i, 1)">▶</button><button :disabled="busy" aria-label="Quitar" @click="removePhoto(p.id)">✕</button></div></div>
       <div class="row seg" role="group" aria-label="Estilo del montaje"><button v-for="s in STYLES" :key="s.id" :class="{ on: mStyle === s.id }" @click="mStyle = s.id">{{ s.label }}</button></div>
       <div class="st">{{ mHint }}</div>
+      <label class="st"><input type="checkbox" v-model="reactOn" /> 🎛 Efectos que reaccionan a la música (destello con los graves, color según la canción, cortes en la percusión)</label>
+      <details v-if="mPhotos.length" class="fold"><summary>🔤 Títulos y texto al ritmo</summary>
+        <input v-model="titles.intro" maxlength="40" placeholder="Título de la intro (p. ej. Verano 2026)" />
+        <input v-model="titles.sub" maxlength="50" placeholder="Subtítulo (opcional)" />
+        <textarea v-model="phrasesText" rows="3" placeholder="Frases que entran palabra a palabra con el ritmo (una por línea)" />
+        <input v-model="titles.outro" maxlength="40" placeholder="Cierre (opcional, p. ej. @usuario)" />
+        <div class="row seg" role="group" aria-label="Tipo de letra"><button v-for="f in FONT_OPTS" :key="f.id" :class="{ on: titles.font === f.id }" @click="titles.font = f.id">{{ f.label }}</button></div>
+        <div class="row seg" role="group" aria-label="Posición"><button :class="{ on: titles.pos === 'top' }" @click="titles.pos = 'top'">Arriba</button><button :class="{ on: titles.pos === 'center' }" @click="titles.pos = 'center'">Centro</button><button :class="{ on: titles.pos === 'bottom' }" @click="titles.pos = 'bottom'">Abajo</button></div>
+        <div class="row"><label class="st">Texto <input type="color" v-model="titles.color" /></label><label class="st">Acento <input type="color" v-model="titles.accent" /></label></div>
+        <div class="st">La intro abre el vídeo, cada frase entra en un primer tiempo (y se clava en los drops) y el cierre cae al final.</div>
+      </details>
+      <details v-if="mPhotos.length" class="fold"><summary>✂️ Guion: transiciones, favoritas y planos</summary>
+        <div class="st">Transiciones permitidas (sin marcar = automático)</div>
+        <div class="chips"><button v-for="t in TRANS_OPTS" :key="t.id" :class="{ on: mTrans.includes(t.id) }" @click="toggleTrans(t.id)">{{ t.label }}</button></div>
+        <div class="st">⭐ Las fotos favoritas salen el doble de veces. Toca un plano para verlo en la vista previa; cambia su foto, encuadre o transición, o súbelo y bájalo.</div>
+        <button v-if="!mShots.length" :disabled="!musicName || analyzing" @click="showScript">Ver el guion</button>
+        <div v-else class="shots">
+          <div v-for="(s, k) in mShots" :key="k" class="shot" @click="seekShot(k)">
+            <span class="t">{{ fmtT(s.t0) }}</span>
+            <select :value="s.photo" @click.stop @change="setEdits({ [k]: { photo: +val($event) } })"><option v-for="(p, i) in mPhotos" :key="p.id" :value="i">Foto {{ i + 1 }}</option></select>
+            <select :value="planoKey(s)" @click.stop @change="onPlano(k, val($event))"><option v-for="o in planoOpts(s.photo)" :key="o.v" :value="o.v">{{ o.l }}</option></select>
+            <select v-if="k > 0" :value="s.trans" :disabled="s.finale" @click.stop @change="setEdits({ [k]: { trans: val($event) as Trans } })"><option v-for="t in TRANS_OPTS" :key="t.id" :value="t.id">{{ t.label }}</option></select>
+            <button :disabled="k === 0" aria-label="Subir plano" @click.stop="swapShots(k, -1)">▲</button><button :disabled="k === mShots.length - 1" aria-label="Bajar plano" @click.stop="swapShots(k, 1)">▼</button>
+          </div>
+          <button v-if="Object.keys(mEdits).length" @click="resetEdits">↺ Quitar mis cambios</button>
+        </div>
+      </details>
       <div v-if="mPhotos.length && musicName" class="row">
         <button v-if="!mPreviewing" :disabled="busy || mPvBusy || analyzing || mAdding" @click="startMontagePreview">{{ mPvBusy ? 'Preparando…' : '▶ Vista previa del montaje' }}</button>
         <template v-else><button @click="mpvToggle">{{ mPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopMontagePreview">✕ Cerrar vista previa</button></template>
@@ -504,6 +641,8 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <label v-if="bgId !== 'none'" class="st"><input type="checkbox" v-model="integrate" /> ✨ Luz y sombra del fondo sobre la persona</label>
     </div>
     <select v-model="tier"><option v-for="(t, k) in tiers" :key="k" :value="k">{{ tierLabel(k) }}</option></select>
+      <div class="row seg" role="group" aria-label="Formato de salida"><button v-for="o in ['mp4', 'webm', 'gif']" :key="o" :class="{ on: outFmt === o }" :disabled="busy" @click="outFmt = o as typeof outFmt">{{ o.toUpperCase() }}</button></div>
+      <div v-if="outFmt === 'gif'" class="st">GIF: sin sonido, hasta {{ GIF_MAX_S }} s, {{ GIF_LONG }} px y {{ GIF_FPS }} fps. WebM: para compartir en web.</div>
     <button v-if="mont" class="go" :disabled="!mPhotos.length || busy || analyzing || mAdding || !!(caps && !caps.ok)" @click="generateMontage">{{ busy ? 'Montando…' : '🎬 Crear montaje' }}</button>
     <button v-else class="go" :disabled="!bitmap || busy || analyzing || !!(caps && !caps.ok)" @click="generate">{{ busy ? 'Animando…' : 'Animar' }}</button>
     <div v-if="busy" class="bar"><i :style="{ width: pct + '%' }" /></div>
@@ -519,6 +658,8 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
 .bgs{display:grid;gap:6px}.chips{display:flex;flex-wrap:wrap;gap:8px}.chips>*{flex:0 0 auto;padding:8px 12px}
 .thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(30%,1fr));gap:6px;padding:6px;width:100%;height:100%;overflow:auto;align-content:start}.thumbs figure{margin:0;position:relative;aspect-ratio:1}.thumbs img{width:100%;height:100%;object-fit:cover;border-radius:10px;display:block}
 .thumbs figcaption{position:absolute;left:4px;bottom:4px;background:rgba(0,0,0,.65);color:#fff;font-size:.7rem;border-radius:8px;padding:1px 6px}
+.fold{display:grid;gap:6px;padding:6px 0}.fold summary{cursor:pointer;font-weight:700}.fold input:not([type=color]),.fold textarea{width:100%;box-sizing:border-box;padding:8px;border-radius:10px;border:2px solid var(--ink);font:inherit}
+.shots{display:grid;gap:4px;max-height:320px;overflow:auto}.shot{display:flex;gap:4px;align-items:center;cursor:pointer}.shot .t{font-size:.75rem;min-width:2.4rem;font-variant-numeric:tabular-nums}.shot select{flex:1;min-width:0;font-size:.8rem;padding:4px}.shot button{flex:0 0 auto;padding:4px 8px}
 .mlist{display:grid;gap:6px}.mrow{display:flex;gap:6px;align-items:center}.mrow img{width:40px;height:40px;object-fit:cover;border-radius:8px}.mrow span{flex:1;font-size:.85rem}.mrow button{flex:0 0 auto;padding:6px 10px}
 .chip{color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.65)}.chips .on{outline:3px solid var(--acc);outline-offset:2px}
 </style>

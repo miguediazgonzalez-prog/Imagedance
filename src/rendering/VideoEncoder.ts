@@ -8,10 +8,12 @@ type Cand = { codec: string; kind: 'mp4' | 'webm' }
 export interface EncodeOut { blob: Blob; ext: string; audio: boolean; audioNote?: string; audioInfo?: string }
 const CANDS: Cand[] = [{ codec: 'avc1.640028', kind: 'mp4' }, { codec: 'avc1.4d0028', kind: 'mp4' }, { codec: 'avc1.42e028', kind: 'mp4' }, { codec: 'vp09.00.10.08', kind: 'webm' }, { codec: 'vp8', kind: 'webm' }]
 
-export async function encodeVideo(canvas: Cv, frames: number, fps: number, draw: (i: number) => void, onProgress: (p: number) => void, audio?: Aud): Promise<EncodeOut> {
+export type Draw = (i: number) => void | Promise<void>
+/** `prefer`: contenedor preferido (mp4 por defecto; webm para compartir en web). Si el dispositivo no lo soporta se usa el otro. */
+export async function encodeVideo(canvas: Cv, frames: number, fps: number, draw: Draw, onProgress: (p: number) => void, audio?: Aud, prefer: 'mp4' | 'webm' = 'mp4'): Promise<EncodeOut> {
   if (!('VideoEncoder' in globalThis)) throw new Error('Este navegador no soporta WebCodecs.')
-  const w = canvas.width, h = canvas.height, bitrate = Math.round(w * h * fps * 0.5); let last: unknown
-  for (const c of CANDS) {
+  const w = canvas.width, h = canvas.height, px = w * h, bitrate = Math.round(px * fps * (px > 1.2e6 ? 0.2 : px > 0.6e6 ? 0.35 : 0.5)); let last: unknown   // en Full HD baja el bitrate por píxel para que el MP4 no pase de ~100 MB
+  for (const c of [...CANDS].sort((a, b) => Number(b.kind === prefer) - Number(a.kind === prefer))) {
     const cfg = { codec: c.codec, width: w, height: h, bitrate, framerate: fps, ...(c.kind === 'mp4' ? { avc: { format: 'avc' } } : {}) } as VideoEncoderConfig
     if (!(await VideoEncoder.isConfigSupported(cfg)).supported) continue
     let note: string | undefined
@@ -22,7 +24,7 @@ export async function encodeVideo(canvas: Cv, frames: number, fps: number, draw:
   throw new Error(last ? `No se pudo codificar el vídeo (${last instanceof Error ? last.message : String(last)}).` : 'No hay códec de vídeo compatible en este dispositivo.')
 }
 
-async function attempt(canvas: Cv, frames: number, fps: number, draw: (i: number) => void, onProgress: (p: number) => void, c: Cand, cfg: VideoEncoderConfig, audio?: Aud): Promise<EncodeOut> {
+async function attempt(canvas: Cv, frames: number, fps: number, draw: Draw, onProgress: (p: number) => void, c: Cand, cfg: VideoEncoderConfig, audio?: Aud): Promise<EncodeOut> {
   const mp4 = c.kind === 'mp4', w = canvas.width, h = canvas.height
   let ac: AudioEncoderConfig | undefined, note: string | undefined
   if (audio) {
@@ -70,7 +72,7 @@ async function attempt(canvas: Cv, frames: number, fps: number, draw: (i: number
   try {
     for (let i = 0; i < frames; i++) {
       if (err) throw err
-      draw(i)
+      await draw(i)
       const f = new VideoFrame(canvas, { timestamp: Math.round((i * 1e6) / fps), duration: Math.round(1e6 / fps) })
       venc.encode(f, { keyFrame: key || i % fps === 0 }); f.close(); key = false
       if (aenc && audio) {

@@ -69,4 +69,31 @@ const w1 = restCam({ kind: 'wide', focus: [] }, photos[1], OW, OH); near(w1.s, c
   near(a.s, b.s, 1e-6, 'cámara continua en el tiempo'); ok(Math.abs(a.rot) < 0.2, 'ladeo pequeño'); ok(shotAt(plan.shots, sh.t0 + 0.01) === 2 && shotAt(plan.shots, plan.shots[3].t0) === 3, 'shotAt encuentra el plano')
   ok(clampCam({ cx: -500, cy: 9999, s: 1 }, ph, OW, OH).cx >= 0, 'clampCam acota')
 }
+
+// 4) Favoritas, transiciones permitidas, golpes de percusión y ediciones manuales
+{
+  const base = { photos, dur: 60, bpm: 128, offset: 0.1, bar0: 0, energy, fps: 30, style: 'dynamic' as Style }
+  const cnt = (S: ReturnType<typeof planMontage>['shots']) => photos.map((_, i) => S.filter(s => s.photo === i).length)
+  const a = cnt(planMontage(base).shots), b = cnt(planMontage({ ...base, weights: [1, 3, 1, 1] }).shots)
+  ok(b[1] > a[1] && b[1] >= Math.max(b[0], b[2], b[3]), `foto favorita: sale más veces (${a[1]} → ${b[1]})`)
+  ok(planMontage({ ...base, weights: [1, 3, 1, 1] }).shots.every((s, i, S) => i === 0 || s.photo !== S[i - 1].photo || s.finale), 'con favoritas nunca repite foto seguida')
+  const only = planMontage({ ...base, trans: ['whip', 'cut'] }).shots; ok(only.every((s, i) => i === 0 || s.trans === 'whip' || s.trans === 'cut' || s.finale === true && false), 'solo usa las transiciones permitidas')
+  ok(planMontage({ ...base, trans: ['spin'] }).shots.every((s, i) => i === 0 || s.trans === 'spin'), 'una sola transición permitida: todas iguales')
+  // Golpes de percusión fuera de beat: en una ráfaga (drop) se corta en ellos
+  const per = 60 / 128, hits = Array.from({ length: 40 }, (_, i) => ({ t: 30.1 + 0.37 + i * per * 0.75, k: 0.9 }))
+  const plainPlan = planMontage({ ...base, style: 'extreme', cuts: [{ t: 30.1, drop: true }] }), plain = plainPlan.shots, withHitsPlan = planMontage({ ...base, style: 'extreme', cuts: [{ t: 30.1, drop: true }], hits }), withHits = { shots: withHitsPlan.shots, impacts: withHitsPlan.impacts }
+  const off = withHits.shots.filter(s => { const j = (s.t0 - 0.1) / per; return Math.abs(j - Math.round(j)) > 1e-3 && s.t0 > 0 }).length
+  ok(off > 0 && plain.filter(s => { const j = (s.t0 - 0.1) / per; return Math.abs(j - Math.round(j)) > 1e-3 && s.t0 > 0 }).length === 0, `cortes en percusión: ${off} fuera de beat (0 sin golpes)`)
+  ok(withHits.shots.every((s, i, S) => s.t1 > s.t0 && (i === 0 || Math.abs(s.t0 - S[i - 1].t1) < 1e-9)), 'con golpes los planos siguen contiguos')
+  ok(withHits.impacts.length > plainPlan.impacts.length, 'los cortes en percusión llevan un pequeño impacto')
+  const soft = planMontage({ ...base, style: 'soft', hits }).shots; ok(soft.every(s => { const j = (s.t0 - 0.1) / per; return Math.abs(j - Math.round(j)) < 1e-3 || s.t0 === 0 || s.t0 === 60 }), 'el estilo elegante nunca corta fuera de beat')
+  // Ediciones
+  const ed = planMontage({ ...base, edits: { 2: { photo: 1, kind: 'face', focus: [0], trans: 'flash' }, 3: { photo: 3, kind: 'face', focus: [5] }, 4: { kind: 'pair', focus: [0, 1] } } }).shots, ref = planMontage(base).shots
+  ok(ed[2].photo === 1 && ed[2].kind === 'face' && ed[2].trans === 'flash' && ed[2].tr > 0, 'edición: foto, plano y transición')
+  ok(ed[3].photo === 3 && ed[3].kind === 'wide', 'edición no válida (foto sin caras) → plano general')
+  ok(ed[4].kind === 'wide' || ph4ok(ed[4]), 'pareja solo si la foto tiene dos caras')
+  ok(ed.length === ref.length && ed.every((s, i) => s.t0 === ref[i].t0 && s.t1 === ref[i].t1), 'las ediciones no cambian los tiempos')
+  const ed0 = planMontage({ ...base, edits: { 0: { trans: 'flash' }, 999: { photo: 1 } } }).shots; ok(ed0[0].trans === 'cut' && ed0[0].tr === 0, 'el primer plano no admite transición; índices fuera de rango se ignoran')
+}
+function ph4ok(s: { photo: number; kind: string; focus: number[] }) { return s.kind === 'pair' && photos[s.photo].faces.length >= 2 }
 console.log(fails ? `\n${fails} fallo(s)` : '\nTodo correcto'); process.exit(fails ? 1 : 0)

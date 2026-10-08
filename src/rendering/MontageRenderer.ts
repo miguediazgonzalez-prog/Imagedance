@@ -8,13 +8,19 @@ import { bodyScaleFor, makePlay, templateFrame, type MotionTemplate, type SyncMo
 import { faceOf, gridFor, layerAlphas, type Face } from '../ai/People'
 import type { BgSpec } from './Backgrounds'
 import { WarpRenderer } from './WarpRenderer'
-import { cameraAt, planMontage, restCam, shotAt, type Cam, type PhotoInfo, type Plan, type Shot, type Style } from './Montage'
+import { cameraAt, restCam, shotAt, type Cam, type PhotoInfo, type Plan, type Shot, type Style } from './Montage'
+import { reactiveFrom, type Reactive } from '../audio/Reactive'
+import { drawTitles, type TitleCfg, type TitleEvent } from './Titles'
 type Cv = HTMLCanvasElement | OffscreenCanvas
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
 type Src = Cv | ImageBitmap
-export interface MPhoto { src: ImageBitmap; /** landmarks en píxeles de src, de izquierda a derecha */ faces: Pt[][]; bg?: BgSpec; mask?: Mask }
+/** Un vídeo corto como entrada: fotogramas JPEG (se decodifican al vuelo) a `fps`; sale como metraje sin deformar, en bucle. */
+export interface MVideo { frames: Blob[]; fps: number }
+export interface MPhoto { src: ImageBitmap; /** landmarks en píxeles de src, de izquierda a derecha */ faces: Pt[][]; bg?: BgSpec; mask?: Mask; video?: MVideo }
 export interface TplCfg { tpl: MotionTemplate; mode: SyncMode; gain: number; mirror: boolean; startAt: number }
-export interface MontageInput { photos: MPhoto[]; ow: number; oh: number; fps: number; dur: number; spec: DanceSpec; style: Style; tpl?: TplCfg; integrate?: boolean; seed?: number }
+export interface MontageTitles { cfg: TitleCfg; events: TitleEvent[] }
+/** `plan` = guion ya calculado (con favoritas, transiciones y ediciones): el mismo para la vista previa y para el export. */
+export interface MontageInput { photos: MPhoto[]; ow: number; oh: number; fps: number; dur: number; spec: DanceSpec; style: Style; plan: Plan; tpl?: TplCfg; integrate?: boolean; titles?: MontageTitles; /** efectos que reaccionan al espectro */ react?: boolean }
 const mk = (w: number, h: number): Cv => { if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h); const c = document.createElement('canvas'); c.width = w; c.height = h; return c }
 const c2d = (c: Cv) => c.getContext('2d') as Ctx
 const rng = (s: number) => () => ((s = (s * 1664525 + 1013904223) % 4294967296) / 4294967296)
@@ -23,15 +29,23 @@ export const infoOf = (photos: MPhoto[]): PhotoInfo[] => photos.map(p => ({ W: p
 
 /** Una foto con sus personas: un WarpRenderer (y su contexto WebGL) por persona, creados solo cuando el plano activo los necesita. */
 class Stage {
-  readonly W: number; readonly H: number; readonly faces: Face[]; used = 0; frame: Src
+  readonly W: number; readonly H: number; readonly faces: Face[]; used = 0; frame: Src; readonly video?: MVideo; private vc = new Map<number, ImageBitmap>(); private vlast?: ImageBitmap
   private rs: (WarpRenderer | null)[] = []; private cv: (Cv | null)[] = []; private comp?: Cv; private tmp?: Cv; private al?: Cv[]; private lastT = NaN
   private specs: DanceSpec[] = []; private plays: (TplPlay | null)[] = []; readonly back: Cv
   constructor(readonly ph: MPhoto, private idx: number, public integrate: boolean) {
-    this.W = ph.src.width; this.H = ph.src.height; this.faces = ph.faces.map(faceOf); this.frame = ph.src
+    this.W = ph.src.width; this.H = ph.src.height; this.faces = ph.faces.map(faceOf); this.frame = ph.src; this.video = ph.video?.frames.length ? ph.video : undefined
     const k = 40 / Math.max(this.W, this.H), bw = Math.max(2, Math.round(this.W * k)), bh = Math.max(2, Math.round(this.H * k))
     this.back = mk(bw, bh); c2d(this.back).drawImage(ph.src, 0, 0, bw, bh)   // fondo desenfocado para cuando la foto no llena el cuadro
   }
   get live() { return this.rs.filter(Boolean).length }
+  private vidx(local: number) { const n = this.video!.frames.length; return ((Math.floor(Math.max(0, local) * this.video!.fps) % n) + n) % n }
+  /** Decodifica el fotograma del vídeo que toca en `local` segundos (caché corta; el render síncrono lo recoge con vframe). */
+  async load(local: number) {
+    if (!this.video) return; const i = this.vidx(local); if (this.vc.has(i)) return
+    this.vc.set(i, await createImageBitmap(this.video.frames[i]))
+    if (this.vc.size > 14) { const k = this.vc.keys().next().value as number; if (this.vc.get(k) !== this.vlast) this.vc.get(k)?.close(); this.vc.delete(k) }
+  }
+  vframe(local: number): ImageBitmap { const f = this.vc.get(this.vidx(local)) ?? this.vlast ?? this.ph.src; this.vlast = f; return f }
   /** Cada persona baila una figura distinta (desfase de 16 beats = misma fase, otra figura) y, con plantilla, las vecinas se reflejan. */
   setSpec(spec: DanceSpec, tpl?: TplCfg) {
     const per = 60 / spec.bpm
@@ -68,26 +82,27 @@ class Stage {
   }
   /** Libera los contextos WebGL (los navegadores limitan los vivos). */
   release() { for (const r of this.rs) r?.dispose(); this.rs = []; this.cv = []; this.lastT = NaN }
+  /** Libera también los fotogramas de vídeo en caché. */
+  free() { this.release(); for (const b of this.vc.values()) b.close(); this.vc.clear(); this.vlast = undefined }
 }
 
 export class Montage {
-  private ctx: Ctx; private stages: Stage[]; private info: PhotoInfo[]; plan!: Plan; private rests = new Map<number, Cam>(); private per = 0.5; private fid = 0
+  private ctx: Ctx; private stages: Stage[]; private info: PhotoInfo[]; plan: Plan; private rests = new Map<number, Cam>(); private per = 0.5; private fid = 0; private rx: Reactive | null = null; private bump = 0
   private vig: Cv; private fxc?: { t: Cv; c: Cv[] }; private sx = 0; private sy = 0; private spec: DanceSpec; private style: Style; private tpl?: TplCfg
   constructor(private canvas: Cv, private inp: MontageInput, private maxCtx = 10) {
     canvas.width = inp.ow; canvas.height = inp.oh; this.ctx = c2d(canvas)
     this.info = infoOf(inp.photos); this.stages = inp.photos.map((p, i) => new Stage(p, i, inp.integrate ?? true))
     const v = mk(inp.ow, inp.oh), g = c2d(v), gr = g.createRadialGradient(inp.ow / 2, inp.oh / 2, Math.min(inp.ow, inp.oh) * 0.35, inp.ow / 2, inp.oh / 2, Math.hypot(inp.ow, inp.oh) * 0.55)
     gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.55)'); g.fillStyle = gr; g.fillRect(0, 0, inp.ow, inp.oh); this.vig = v
-    this.spec = inp.spec; this.style = inp.style; this.tpl = inp.tpl; this.replan()
+    this.spec = inp.spec; this.style = inp.style; this.tpl = inp.tpl; this.plan = inp.plan; this.replan()
   }
   get isGpu() { return true }
   private replan() {
-    const s = this.spec; this.per = 60 / s.bpm; this.rests.clear()
-    this.plan = planMontage({ photos: this.info, dur: this.inp.dur, bpm: s.bpm, offset: s.offset, bar0: s.bar0, cuts: s.cuts, energy: s.energy, fps: s.fps, style: this.style, seed: this.inp.seed })
+    const s = this.spec; this.per = 60 / s.bpm; this.rests.clear(); this.rx = this.inp.react && s.bands ? reactiveFrom(s.bands, s.fps) : null
     for (const st of this.stages) st.setSpec(s, this.tpl)
   }
-  /** BPM, compás, energía, estilo o plantilla nuevos: se rehace el guion sin tocar las fotos. */
-  update(spec: DanceSpec, style: Style, tpl?: TplCfg, dur = this.inp.dur) { this.spec = spec; this.style = style; this.tpl = tpl; this.inp = { ...this.inp, dur }; this.replan() }
+  /** BPM, compás, energía, estilo, plantilla, guion o títulos nuevos: se rehace lo que depende de ellos sin tocar las fotos. */
+  update(spec: DanceSpec, style: Style, tpl: TplCfg | undefined, dur: number, plan: Plan, titles?: MontageTitles, react = this.inp.react) { this.spec = spec; this.style = style; this.tpl = tpl; this.plan = plan; this.inp = { ...this.inp, dur, plan, titles, react }; this.replan() }
   /** Fondo y recorte de una foto; los renderizadores se rehacen al vuelo. */
   setBackground(i: number, bg?: BgSpec, mask?: Mask) { const s = this.stages[i]; if (!s) return; s.ph.bg = bg; s.ph.mask = bg ? mask : undefined; s.release() }
   setIntegrate(on: boolean) { for (const s of this.stages) { s.integrate = on; s.release() } }
@@ -101,8 +116,8 @@ export class Montage {
   /** Dibuja un plano: fondo desenfocado si la foto no llena el cuadro + foto con la cámara del guion. x = efectos de la transición. */
   private layer(k: number, t: number, x: { ox?: number; scale?: number; rot?: number; alpha?: number } = {}) {
     const sh = this.plan.shots[k], st = this.stage(sh.photo), ph = this.info[sh.photo], { ow, oh } = this.inp, ctx = this.ctx
-    st.update(t)
-    const cam = cameraAt(sh, this.rest(k), ph, ow, oh, t, this.per, this.spec.offset), rot = cam.rot + (x.rot ?? 0), sc = x.scale ?? 1, s = cam.s * sc
+    st.update(t); if (st.video) st.frame = st.vframe(t - sh.t0 + k * 1.37)
+    const cam = cameraAt(sh, this.rest(k), ph, ow, oh, t, this.per, this.spec.offset, this.bump), rot = cam.rot + (x.rot ?? 0), sc = x.scale ?? 1, s = cam.s * sc
     ctx.save(); ctx.globalAlpha = x.alpha ?? 1; ctx.translate(x.ox ?? 0, 0); ctx.beginPath(); ctx.rect(0, 0, ow, oh); ctx.clip()
     if (ow / s > ph.W || oh / s > ph.H || Math.abs(rot) > 5e-4) {
       const b = st.back, f = Math.max(ow / b.width, oh / b.height); ctx.drawImage(b, (ow - b.width * f) / 2, (oh - b.height * f) / 2, b.width * f, b.height * f); ctx.fillStyle = 'rgba(0,0,0,0.38)'; ctx.fillRect(0, 0, ow, oh)
@@ -140,22 +155,42 @@ export class Montage {
       default: this.layer(B, t)
     }
   }
+  /** Qué se ve en t: un plano, o una transición entre dos (A sale, B entra, p = avance 0..1). */
+  private which(t: number): { A: number; B: number; p: number; sh: Shot } {
+    const S = this.plan.shots, k = shotAt(S, t), nx = S[k + 1], cur = S[k]
+    if (nx && nx.tr > 0 && t >= nx.t0 - nx.tr / 2) return { A: k, B: k + 1, p: (t - (nx.t0 - nx.tr / 2)) / nx.tr, sh: nx }
+    if (k > 0 && cur.tr > 0 && t < cur.t0 + cur.tr / 2) return { A: k - 1, B: k, p: (t - (cur.t0 - cur.tr / 2)) / cur.tr, sh: cur }
+    return { A: -1, B: k, p: 1, sh: cur }
+  }
+  /** Decodifica los fotogramas de vídeo que hacen falta en t. Llamar (y esperar) antes de render(t) cuando haya vídeos; si no los hay, no cuesta nada. */
+  async prepare(t: number) {
+    if (!this.stages.some(s => s.video)) return
+    const w = this.which(t), S = this.plan.shots
+    for (const k of w.A >= 0 ? [w.A, w.B] : [w.B]) { const st = this.stages[S[k].photo]; if (st.video) await st.load(t - S[k].t0 + k * 1.37) }
+  }
   /** Dibuja el instante t (s desde el inicio del montaje) en el canvas de salida. */
   render(t: number) {
-    const { ow, oh, dur } = this.inp, ctx = this.ctx, S = this.plan.shots, k = shotAt(S, t); this.fid++
-    // Sacudida en los impactos (cambios de sección y drops)
+    const { ow, oh, dur, fps } = this.inp, ctx = this.ctx, w = this.which(t), idx = Math.max(0, Math.round(t * fps)), amp = { soft: 0.5, dynamic: 0.85, extreme: 1.15 }[this.style]; this.fid++
+    const rx = this.rx, kick = rx ? rx.kick[Math.min(rx.kick.length - 1, idx)] : 0, hue = rx ? rx.hue[Math.min(rx.hue.length - 1, idx)] : 0
+    this.bump = 0.035 * kick * amp   // el zoom también responde al bombo real, no solo al metrónomo
+    // Sacudida en los impactos (cambios de sección, drops y golpes de percusión)
     let kx = 0, ky = 0; this.plan.impacts.forEach((m, i) => { const d = t - m.t; if (d >= 0 && d < 0.4) { const a = m.k * Math.exp(-14 * d); kx += a * Math.sin(d * 90 + i); ky += a * Math.cos(d * 77 + 2 * i) } })
-    const amp = { soft: 0.4, dynamic: 0.8, extreme: 1.2 }[this.style] * 0.014 * ow; this.sx = amp * kx; this.sy = amp * ky
+    const sh = amp * 0.012 * ow; this.sx = sh * kx; this.sy = sh * ky
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, ow, oh)
-    const nx = S[k + 1], cur = S[k]
-    if (nx && nx.tr > 0 && t >= nx.t0 - nx.tr / 2) this.transition(nx, k, k + 1, (t - (nx.t0 - nx.tr / 2)) / nx.tr, t)
-    else if (k > 0 && cur.tr > 0 && t < cur.t0 + cur.tr / 2) this.transition(cur, k - 1, k, (t - (cur.t0 - cur.tr / 2)) / cur.tr, t)
-    else this.layer(k, t)
-    // Flash en los impactos, acento en el primer tiempo del compás, viñeta y fundidos
+    if (w.A >= 0) this.transition(w.sh, w.A, w.B, w.p, t); else this.layer(w.B, t)
+    // Flash en los impactos, acento en el primer tiempo del compás
     for (const m of this.plan.impacts) { const d = t - m.t; if (d >= 0 && d < 0.6) this.white(m.k * 0.85 * Math.exp(-9 * d)) }
     if (this.style !== 'soft') { const b = (t - this.spec.offset) / this.per - (this.spec.bar0 ?? 0), bib = ((b % 4) + 4) % 4; if (bib < 1) this.white((this.style === 'extreme' ? 0.09 : 0.05) * Math.exp(-9 * bib)) }
+    // Color de la canción: el tono sigue el equilibrio graves/agudos y cambia de paleta en cada sección; el bombo da un destello tintado
+    if (rx) {
+      const sec = (this.spec.secBase ?? 0) + (this.spec.cuts ?? []).filter(c => c.t <= t).length, h = (hue + 53 * sec) % 360
+      ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = 'soft-light'; ctx.globalAlpha = 0.34 * amp; ctx.fillStyle = `hsl(${h},85%,52%)`; ctx.fillRect(0, 0, ow, oh)
+      if (kick > 0.02) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.min(1, kick * 0.2 * amp); ctx.fillStyle = `hsl(${(h + 30) % 360},90%,50%)`; ctx.fillRect(0, 0, ow, oh) }
+      ctx.restore()
+    }
     ctx.drawImage(this.vig as CanvasImageSource, 0, 0)
+    const T = this.inp.titles; if (T?.events.length) drawTitles(ctx, T.events, t, T.cfg, ow, oh, this.per, this.spec.offset)
     this.black(1 - Math.min(1, t / 0.3)); this.black((t - (dur - 0.7)) / 0.7)
   }
-  dispose() { for (const s of this.stages) s.release() }
+  dispose() { for (const s of this.stages) s.free() }
 }
