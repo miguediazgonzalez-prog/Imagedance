@@ -102,9 +102,9 @@ export class WarpRenderer {
   private hw!: Float32Array; private zb!: Float32Array; private n0!: Float32Array; private sm?: Float32Array; private so?: Float32Array
   private gpu = false; private G!: { tex: WebGLTexture[]; fbo: WebGLFramebuffer[]; S: WebGLTexture; pw: GpuProg; ps: GpuProg; pf: GpuProg; uE: Float32Array; uI: Float32Array; uB: Float32Array; uM: Float32Array }
   /** true si la deformación de la malla se calcula en la GPU (si no, en CPU). */
-  get isGpu() { return this.gpu } private zLip = 0; private piv = { x: 0, y: 0 }; private tr = new Float64Array(6); private tmp = new Float64Array(3)
+  get isGpu() { return this.gpu } private piv = { x: 0, y: 0 }; private tr = new Float64Array(6); private tmp = new Float64Array(3)
   private arms: ArmRig | null = null; private uA = new Float32Array(24); private bgs = new Map<BgId, BgProg>(); private bgp?: BgProg; private ig = 1; private bvao!: WebGLVertexArrayObject; private tMask!: WebGLTexture; private tBg!: WebGLTexture; private um: WebGLUniformLocation | null = null
-  private vsMesh!: WebGLShader; private mp!: WebGLProgram; private mvao!: WebGLVertexArrayObject; private ip!: WebGLProgram; private ivao!: WebGLVertexArrayObject; private ie!: WebGLUniformLocation
+  private vsMesh!: WebGLShader; private mp!: WebGLProgram; private mvao!: WebGLVertexArrayObject;
   constructor(canvas: HTMLCanvasElement | OffscreenCanvas, src: ImageBitmap, private L: Pt[], bg?: BgSpec, mask?: Mask, useGpu = true) {
     const W = (canvas.width = src.width), H = (canvas.height = src.height); this.W = W; this.H = H
     const gl = (canvas as HTMLCanvasElement).getContext('webgl2', { antialias: true }); if (!gl) throw new Error('WebGL2 no disponible')
@@ -134,14 +134,7 @@ precision mediump float; in vec2 v; in float sh; uniform sampler2D t; uniform sa
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return t }
     this.tMask = tex(gl.TEXTURE1); this.tBg = tex(gl.TEXTURE2); gl.activeTexture(gl.TEXTURE0)
-    // Interior de la boca: elipse oscura y suave que tapa el hueco entre labios al abrir (sin dientes inventados).
-    const ip = (this.ip = gl.createProgram()!)
-    gl.attachShader(ip, this.sh(gl.VERTEX_SHADER, `#version 300 es
-uniform vec2 WH; out vec2 px; void main(){vec2 q=vec2(float(gl_VertexID&1),float(gl_VertexID>>1)); px=vec2(q.x,1.-q.y)*WH; gl_Position=vec4(q*2.-1.,0.,1.);}`))
-    gl.attachShader(ip, this.sh(gl.FRAGMENT_SHADER, `#version 300 es
-precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){float d=length((px-e.xy)/e.zw); o=vec4(.17,.06,.08,.92*(1.-smoothstep(.75,1.,d)));}`))
-    gl.linkProgram(ip); gl.useProgram(ip); gl.uniform2f(gl.getUniformLocation(ip, 'WH'), W, H); this.ie = gl.getUniformLocation(ip, 'e')!
-    this.ivao = gl.createVertexArray()!; this.bvao = gl.createVertexArray()!
+    this.bvao = gl.createVertexArray()!
     gl.useProgram(pr); gl.bindVertexArray(this.mvao)
     gl.viewport(0, 0, W, H)
     this.setBackground(bg); this.setMask(bg ? mask : undefined)
@@ -188,7 +181,7 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
   private initDepth() {
     const { L, fs, base, W, H } = this, V = base.length / 2, c = L[1], zOf = (p: Pt) => p.z ?? 0
     const zEar = (zOf(L[234]) + zOf(L[454])) / 2, zr = L.map(p => (zOf(p) - zEar) * DEPTH_GAIN)
-    this.piv = { x: (L[234].x + L[454].x) / 2, y: (L[234].y + L[454].y) / 2 + fs * PIVOT_DOWN }; this.zLip = zr[14]
+    this.piv = { x: (L[234].x + L[454].x) / 2, y: (L[234].y + L[454].y) / 2 + fs * PIVOT_DOWN }
     this.hw = new Float32Array(V); this.zb = new Float32Array(V); this.n0 = new Float32Array(V * 3)
     const ey = (L[234].y + L[454].y) / 2, cy = ey + SKULL.dy * fs, N1 = N + 1
     const s2 = (fs * 0.07) ** 2, cut = 3 * fs * 0.07
@@ -344,13 +337,5 @@ precision mediump float; in vec2 px; uniform vec4 e; out vec4 o; void main(){flo
     if (this.masked && this.bgp) { gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA) }
     if (pp) { gl.useProgram(pp.p); gl.uniform1f(pp.T, t); gl.uniform1f(pp.P, pulse); gl.uniform3f(pp.S, sBass, sMid, sTreb); gl.uniform1f(pp.ig, this.ig) } else gl.useProgram(this.mp)
     gl.drawElements(gl.TRIANGLES, this.n, gl.UNSIGNED_INT, 0); gl.disable(gl.DEPTH_TEST)
-    const gap = m.mouthOpen * fs * 0.09
-    if (gap > 1.5) {
-      gl.useProgram(this.ip); gl.bindVertexArray(this.ivao); gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
-      const dz = Math.max(0, lip.y - mid.y), my = (mid.y + lip.y + gap) / 2, hw = Math.exp(-((Math.hypot(lip.x - c.x, my - c.y) / (fs * 1.15)) ** 4))
-      this.project(lip.x, my, this.zLip)   // el interior de la boca sigue el giro 3D de la cabeza
-      gl.uniform4f(this.ie, lip.x + (this.tmp[0] - lip.x) * hw, my + (this.tmp[1] - my) * hw, Math.hypot(L[78].x - L[308].x, L[78].y - L[308].y) * 0.42 * (1 - m.lipRound * 0.35) * Math.max(0.5, this.tr[0]), (gap + dz) / 2 + fs * 0.012)
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disable(gl.BLEND); gl.useProgram(this.mp); gl.bindVertexArray(this.mvao)
-    }
   }
 }

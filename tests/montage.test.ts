@@ -96,4 +96,10 @@ const w1 = restCam({ kind: 'wide', focus: [] }, photos[1], OW, OH); near(w1.s, c
   const ed0 = planMontage({ ...base, edits: { 0: { trans: 'flash' }, 999: { photo: 1 } } }).shots; ok(ed0[0].trans === 'cut' && ed0[0].tr === 0, 'el primer plano no admite transición; índices fuera de rango se ignoran')
 }
 function ph4ok(s: { photo: number; kind: string; focus: number[] }) { return s.kind === 'pair' && photos[s.photo].faces.length >= 2 }
+
+// 5) Duraciones largas (hasta 4 min): el guion cubre todo el vídeo, también con cortes de 1 beat
+for (const dur of [5, 90, 240]) for (const bpm of [80, 174]) {
+  const S = planMontage({ photos, dur, bpm, offset: 0, fps: 30, style: 'extreme', energy: Array.from({ length: dur * 30 }, () => 0.9) }).shots
+  ok(S[0].t0 === 0 && Math.abs(S[S.length - 1].t1 - dur) < 1e-9 && S[S.length - 1].finale, `${dur} s a ${bpm} BPM: ${S.length} planos cubren todo el vídeo`)
+}
 console.log(fails ? `\n${fails} fallo(s)` : '\nTodo correcto'); process.exit(fails ? 1 : 0)

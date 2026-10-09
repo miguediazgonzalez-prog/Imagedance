@@ -11,3 +11,9 @@ button:disabled{opacity:.45}textarea{min-height:88px;resize:vertical}.row{displa
 .st{font-size:.9rem;color:var(--mut);min-height:1.2em}:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
 .frame canvas{width:100%;height:100%;touch-action:none;cursor:grab}.frame canvas.pv{touch-action:auto;cursor:default}input[type=range]{accent-color:var(--acc)}
 .lnk{border:0;background:none;text-decoration:underline;color:var(--mut);font-weight:400}
+
+.tabs{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 0}.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:0 0 auto;padding:8px 14px;border-radius:999px;white-space:nowrap}.tabs button.on{background:var(--ink);color:#fff}
+.panel{display:grid;gap:10px}.info summary{cursor:pointer;font-size:.8rem;color:var(--mut)}
+.tracks{display:grid;gap:6px}.trk{display:flex;gap:6px}.trk>button:first-child{flex:1;text-align:left}.trk .pl{flex:0 0 52px}.trk button.on{background:var(--ink);color:#fff}
+.player{display:grid;gap:4px}.player audio{width:100%}

@@ -45,7 +45,7 @@ function bounds(o: PlanOpts, scale: number) {
   const energyAt = (t: number) => (o.energy?.length ? o.energy[Math.min(o.energy.length - 1, Math.max(0, Math.round(t * fps)))] : 0.6)
   const drops = cuts.filter(c => c.drop).map(c => c.t), inDrop = (t: number) => drops.some(d => t >= d - 1e-6 && t < d + 8 * per)
   const out: { t: number; cut: Cut }[] = [{ t: 0, cut: null }]; let t = 0
-  for (let g = 0; g < 600 && t < dur - 1e-6; g++) {
+  for (let g = 0; g < 4000 && t < dur - 1e-6; g++) {
     const e = energyAt(t), L = Math.max(1, Math.round((inDrop(t) ? DROPLEN[o.style] : e >= 0.7 ? LEN[o.style][2] : e >= 0.4 ? LEN[o.style][1] : LEN[o.style][0]) * bs))
     const js = Math.ceil((t - offset) / per - 1e-6); let je = js + L
     if (L >= 4) { let bd = Infinity; for (let j = je - L / 2; j <= je + L / 2; j++) if (j >= js + 2 && isDown(j) && Math.abs(j - je) < bd) { bd = Math.abs(j - je); je = j } }   // los planos largos terminan en primer tiempo de compás

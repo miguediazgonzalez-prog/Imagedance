@@ -11,6 +11,7 @@ import { renderVideo } from './rendering/renderClient'
 import { analyzeTempo, beatOffset, energyFrames, type Tempo } from './audio/BeatDetector'
 import { analyzeSpectral, analyzeBars, bestStart, bandFrames, type Spectral, type Bars } from './audio/Structure'
 import { TRACKS, trackUrl, type Track } from './audio/Tracks'
+import { libAdd, libList, libRemove, libClear, type LibItem } from './audio/Library'
 import { segmentPerson, type Mask } from './ai/Segmenter'
 import { refineMask } from './ai/Matting'
 import { BG_UI, coverBitmap, type BgId, type BgSpec } from './rendering/Backgrounds'
@@ -30,7 +31,9 @@ import { scaleFace } from './ai/MultiFace'
 import { reactiveFrom } from './audio/Reactive'
 import { defaultTitles, hasTitles, planTitles, type TitleCfg, type TitleFont } from './rendering/Titles'
 import { packProject, unpackProject, packFaces, unpackFaces, photoFile, frameFile, EXT, type Manifest, type ProjectPhoto, type ProjectSettings } from './montage/project'
-const tiers = { fast: { s: 512, fps: 24, d: 5, dd: 60, label: 'Rápido · 512 px · 5 s' }, balanced: { s: 768, fps: 24, d: 7, dd: 60, label: 'Normal · 768 px · 7 s' }, quality: { s: 1024, fps: 30, d: 10, dd: 60, label: 'Alta · 1024 px · 10 s' }, hd: { s: 1440, fps: 30, d: 10, dd: 60, label: 'Full HD · 1080p · 10 s' } }
+const tiers = { fast: { s: 512, fps: 24, label: 'Rápido · 512 px' }, balanced: { s: 768, fps: 24, label: 'Normal · 768 px' }, quality: { s: 1024, fps: 30, label: 'Alta · 1024 px' }, hd: { s: 1440, fps: 30, label: 'Full HD · 1080p' } }
+/** Duración del vídeo, independiente de la calidad (5 s – 4 min). */
+const DUR_MIN = 5, DUR_MAX = 240, durSel = ref(60)
 const tier = ref<keyof typeof tiers>('fast'), prompt = ref('')
 // Formato de salida: cuadrado 1:1 o vertical 9:16 (redes). El vertical conserva el nº de píxeles de la talla elegida: 512→384×682, 768→576×1024, 1024→768×1366
 type Fmt = 'sq' | 'v' | '45' | 'h'
@@ -103,11 +106,11 @@ function bestMoment() {
   startAt.value = Math.min(maxStart.value, Math.round(bestStart(B, Math.min(danceMax.value, musicDur.value)) * 2) / 2)
   status.value = 'Fragmento elegido: arranca en el cambio de sección más potente.'
 }
-const danceMax = computed(() => tiers[tier.value].dd)
+const danceMax = computed(() => durSel.value)
 const maxStart = computed(() => Math.max(0, musicDur.value - Math.min(danceMax.value, musicDur.value)))
 const danceDur = computed(() => Math.max(1, Math.min(danceMax.value, musicDur.value - startAt.value)))
 watch([tier, musicDur], () => { startAt.value = Math.min(startAt.value, maxStart.value) })
-const tierLabel = (k: keyof typeof tiers) => { const [name] = tiers[k].label.split(' · '), D = dimsFor(tiers[k].s); return `${name} · ${fmt.value === 'sq' && k !== 'hd' ? `${D.W} px` : `${D.W}×${D.H}`} · ${dance.value ? `hasta ${tiers[k].dd}` : tiers[k].d} s` }
+const tierLabel = (k: keyof typeof tiers) => { const [name] = tiers[k].label.split(' · '), D = dimsFor(tiers[k].s); return `${name} · ${fmt.value === 'sq' && k !== 'hd' ? `${D.W} px` : `${D.W}×${D.H}`}` }
 const setBpm = (v: number) => { bpm.value = Math.min(240, Math.max(40, Math.round(v * 10) / 10)); barShift.value = 0 }
 function clearMusic() { if (musicUrl.value) URL.revokeObjectURL(musicUrl.value); musicUrl.value = ''; musicName.value = ''; selTrack.value = ''; gridOrigin = null; musicDur.value = 0; bpm.value = 0; startAt.value = 0; musicBuf = musicMono = tempo = null; aud = null; enKey = ''; spectral = null; structP = null; barsKey = ''; g0Key = ''; barShift.value = 0; bars.value = null }
 /** Carga una canción (subida o incluida), la analiza y deja lista la edición. `known` = BPM exacto de las incluidas; `auto` = carga silenciosa al abrir la app. */
@@ -121,9 +124,27 @@ async function loadMusic(blob: Blob, name: string, known?: number, trackId = '',
     pvLater(true); void ensureStructure().then(() => { refreshBars(); pvLater(false) })
   } catch { clearMusic(); if (!auto) status.value = 'No pude leer ese audio. Prueba con MP3, M4A, WAV u OGG.' } finally { analyzing.value = false }
 }
+/** Música subida: se analiza y, si se lee bien, se guarda en «Mi música» para elegirla en próximas sesiones. */
 async function pickMusic(e: Event) {
   const input = e.target as HTMLInputElement, f = input.files?.[0]; input.value = ''; if (!f) return
-  await loadMusic(f, f.name)
+  await loadMusic(f, f.name); if (!musicBuf) return
+  try {
+    void navigator.storage?.persist?.()
+    const r = await libAdd(f, f.name); await refreshMine(); selTrack.value = r.item.id
+    status.value += r.added ? ` Guardada en Mi música: la tendrás para otras veces.` : ` Ya estaba en Mi música.`
+  } catch (err) { status.value += ` ${err instanceof Error ? err.message : String(err)}` }
+}
+// ───────────── Mi música (biblioteca persistente) ─────────────
+const myMusic = ref<LibItem[]>([]), mineUrls = new Map<string, string>()
+const myMb = computed(() => (myMusic.value.reduce((n, m) => n + m.size, 0) / 1048576).toFixed(1))
+const refreshMine = async () => { try { myMusic.value = await libList() } catch { myMusic.value = [] } }
+const mineUrl = (m: LibItem) => { let u = mineUrls.get(m.id); if (!u) { u = URL.createObjectURL(m.blob); mineUrls.set(m.id, u) } return u }
+async function pickMine(m: LibItem) { if (busy.value || analyzing.value) return; await loadMusic(m.blob, m.name, undefined, m.id) }
+async function removeMine(m: LibItem) {
+  if (!confirm(`¿Quitar «${m.name}» de Mi música?`)) return
+  await libRemove(m.id); const u = mineUrls.get(m.id); if (u) { if (preUrl.value === u) { stopListen(); preUrl.value = '' } URL.revokeObjectURL(u); mineUrls.delete(m.id) }
+  if (selTrack.value === m.id) selTrack.value = ''
+  await refreshMine()
 }
 async function pickTrack(t: Track, auto = false) {
   if (busy.value || analyzing.value) return
@@ -377,17 +398,34 @@ async function openProject(e: Event) {
     bgId.value = s.bgId === 'image' ? (bgBmp.value ? 'image' : 'none') : s.bgId === 'none' || BG_UI.some(b => b.id === s.bgId) ? (s.bgId as BgId | 'none') : 'none'
     if (s.tpl?.json) { try { tpl.value = parseTemplate(s.tpl.json); tplOn.value = s.tpl.on !== false; tplMode.value = s.tpl.mode as SyncMode; tplGain.value = Number(s.tpl.gain) || 1; tplMirror.value = !!s.tpl.mirror; tplNote.value = `${tpl.value.dur.toFixed(1)} s` } catch { /* plantilla ilegible: se ignora */ } }
     mont.value = true; dance.value = true
-    const tr = TRACKS.find(x => x.id === s.track)
-    if (tr) { await pickTrack(tr); startAt.value = Math.max(0, Math.min(maxStart.value, Number(s.startAt) || 0)) }
+    const tr = TRACKS.find(x => x.id === s.track), mine = myMusic.value.find(x => x.id === s.track)
+    if (mine) await pickMine(mine)
+    if (tr || mine) { if (tr) await pickTrack(tr); startAt.value = Math.max(0, Math.min(maxStart.value, Number(s.startAt) || 0)) }
     await showScript(); mEditsSig = sigOf(); mEdits.value = cleanEdits(s.edits); await nextTick(); refreshShots()
-    status.value = `Proyecto abierto: ${recs.length} elemento${recs.length > 1 ? 's' : ''}.${tr ? '' : ` Elige de nuevo la canción${s.musicName ? ` «${s.musicName}»` : ''} (o otra) y se aplicará el guion.`}`
+    status.value = `Proyecto abierto: ${recs.length} elemento${recs.length > 1 ? 's' : ''}.${tr || mine ? '' : ` Elige de nuevo la canción${s.musicName ? ` «${s.musicName}»` : ''} (o otra) y se aplicará el guion.`}`
   } catch (err) { status.value = err instanceof Error ? err.message : String(err) } finally { mAdding.value = false }
 }
+// ───────────── Pestañas y preescucha ─────────────
+type Tab = 'foto' | 'sonido' | 'baile' | 'fondo' | 'formato' | 'texto' | 'guion'
+const tab = ref<Tab>('foto')
+const TABS = computed<{ id: Tab; label: string }[]>(() => [{ id: 'foto', label: mont.value ? '🎬 Fotos' : '📷 Foto' }, { id: 'sonido', label: '🎵 Sonido' }, ...(dance.value ? [{ id: 'baile' as Tab, label: '💃 Baile' }] : []), { id: 'fondo', label: '🖼 Fondo' }, { id: 'formato', label: '📐 Formato' }, ...(mont.value ? [{ id: 'texto' as Tab, label: '🔤 Texto' }, { id: 'guion' as Tab, label: '✂️ Guion' }] : [])])
+watch(TABS, t => { if (!t.some(x => x.id === tab.value)) tab.value = 'foto' })
+const preAudio = ref<HTMLAudioElement | null>(null), preUrl = ref(''), preName = ref(''), preOn = ref(false)
+/** Preescucha de una canción (o de la tuya desde el punto elegido) sin cargarla en el montaje. */
+function listen(url: string, name: string, from = 0) {
+  const a = preAudio.value
+  if (a && preUrl.value === url) { if (a.paused) void a.play().catch(() => {}); else a.pause(); return }
+  preUrl.value = url; preName.value = name; preOn.value = false
+  void nextTick(() => { const el = preAudio.value; if (!el) return; el.addEventListener('loadedmetadata', () => { el.currentTime = Math.min(from, Math.max(0, el.duration - 0.5)); void el.play().catch(() => {}) }, { once: true }); el.load() })
+}
+const stopListen = () => { preAudio.value?.pause() }
+watch([previewing, mPreviewing, busy], ([a, b, c]) => { if (a || b || c) stopListen() })
 const caps = ref<Caps | null>(null), modelMb = ref<number | null>(null), mode = ref('')
 const capsLine = computed(() => { const c = caps.value; return c ? `Modo recomendado: ${tiers[c.tier].label}. ${c.cores} núcleos${c.memory ? ` · ~${c.memory} GB` : ''} · WebGPU ${c.webgpu ? 'disponible' : 'no disponible'} · SIMD ${c.simd ? 'sí' : 'no'}` : '' })
 const modelLine = computed(() => (modelMb.value ? `Modelo descargado: ${modelMb.value.toFixed(0)} MB · disponible offline` : 'El modelo facial se descargará la primera vez.'))
-onMounted(() => { if (dance.value) pickTrack(TRACKS[0], true); detectCaps().then(c => { caps.value = c; tier.value = c.tier; if (!c.ok) status.value = c.problems.join(' ') }); modelStatus().then(v => (modelMb.value = v)) })
-async function wipe() { if (!confirm('Se borrará el modelo descargado y las fotos actuales. ¿Continuar?')) return; clear(); clearPhotos(); clearVoice(); clearMusic(); bgBmp.value = null; bgId.value = 'none'; await clearLocalData(); modelMb.value = null; mode.value = ''; status.value = 'Datos locales borrados.' }
+watch(durSel, () => { startAt.value = Math.min(startAt.value, maxStart.value); pvLater(true); mpvLater(true) })
+onMounted(() => { void refreshMine(); if (dance.value) pickTrack(TRACKS[0], true); detectCaps().then(c => { caps.value = c; tier.value = c.tier; if (!c.ok) status.value = c.problems.join(' ') }); modelStatus().then(v => (modelMb.value = v)) })
+async function wipe() { if (!confirm('Se borrará el modelo descargado, las fotos actuales y tu música guardada. ¿Continuar?')) return; clear(); clearPhotos(); clearVoice(); clearMusic(); await libClear(); myMusic.value = []; bgBmp.value = null; bgId.value = 'none'; await clearLocalData(); modelMb.value = null; mode.value = ''; status.value = 'Datos locales borrados.' }
 const crop = reactive({ zoom: 1, cx: 0, cy: 0, rot: 0 }), cv = ref<HTMLCanvasElement | null>(null)
 const pts = new Map<number, { x: number; y: number }>(); let pinch0 = 1, zoom0 = 1
 const gap = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1 }
@@ -441,7 +479,7 @@ async function generate() {
     }
     let rig: ArmRig | null = null
     if (dance.value && tplWantsArms()) { status.value = 'Buscando los brazos en la foto… (la primera vez se descarga el modelo de cuerpo)'; await new Promise(r => setTimeout(r, 30)); rig = await armsOf(src) }
-    const input = await createImageBitmap(src); let job: Parameters<typeof renderVideo>[0], buf: AudioBuffer | null = null, ins = parseInstruction('', T.d)
+    const input = await createImageBitmap(src); let job: Parameters<typeof renderVideo>[0], buf: AudioBuffer | null = null, ins = parseInstruction('', durSel.value)
     speechText.value = ''
     if (dance.value) {
       const sr = musicBuf!.sampleRate, frames = Math.floor(Math.min(danceDur.value, outFmt.value === 'gif' ? GIF_MAX_S : Infinity) * T.fps), dur = frames / T.fps, t0 = startAt.value
@@ -452,7 +490,7 @@ async function generate() {
       playUrl.value = musicUrl.value; playFrom = t0; aud = null
     } else {
       buf = voiceBuf.value
-      const dur = buf ? Math.min(10, Math.max(T.d, Math.ceil(buf.duration + 0.8))) : T.d; ins = parseInstruction(prompt.value, dur); let vis: VisemeFrame[] | undefined
+      const dur = buf ? Math.min(DUR_MAX, Math.ceil(buf.duration + 0.8)) : durSel.value; ins = parseInstruction(prompt.value, dur); let vis: VisemeFrame[] | undefined
       if (buf) vis = audioVisemes(buf, T.fps, dur)
       else if (ins.speech) { speechText.value = ins.speech; vis = textVisemes(ins.speech, T.fps, dur) }
       const audio = buf ? { mono: toMono(buf), sampleRate: buf.sampleRate } : undefined
@@ -522,6 +560,14 @@ watch(dance, v => { if (!v) stopPreview() })
 function setFmt(f: Fmt) { if (fmt.value === f) return; stopPreview(); stopMontagePreview(); clear(false); fmt.value = f; if (bitmap.value) resetCrop(bitmap.value, crop, AR.value) }
 const fname = () => `foto-animada.${out.value!.ext}`
 const dur0 = (j: { dur: number }) => j.dur.toFixed(0)
+const durLabel = (s: number) => (s < 60 ? `${s} s` : `${Math.floor(s / 60)} min${s % 60 ? ` ${s % 60} s` : ''}`)
+/** Peso aproximado del archivo (mismo bitrate que el codificador) y aviso si es demasiado para la memoria del dispositivo. */
+const sizeHint = computed(() => {
+  const E = eff(), px = E.D.W * E.D.H, secs = Math.min(dance.value && musicDur.value ? danceDur.value : durSel.value, outFmt.value === 'gif' ? GIF_MAX_S : DUR_MAX)
+  if (outFmt.value === 'gif') return `GIF de ${Math.round(secs)} s a ${E.D.W}×${E.D.H}: sin sonido, máximo ${GIF_MAX_S} s.`
+  const mb = (px * E.fps * (px > 1.2e6 ? 0.2 : px > 0.6e6 ? 0.35 : 0.5) * secs) / 8 / 1048576
+  return `${E.D.W}×${E.D.H} · ${E.fps} fps · ${Math.round(secs)} s ≈ ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB${mb > 350 ? '. Mucho para la memoria de un móvil: baja la calidad o la duración.' : ''}`
+})
 function save() { const a = document.createElement('a'); a.href = videoUrl.value; a.download = fname(); a.click() }
 const share = () => navigator.share({ files: [new File([out.value!.blob], fname(), { type: out.value!.blob.type })] }).catch(() => {})
 </script>
@@ -529,9 +575,11 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
   <main>
     <h1>✨ Foto animada</h1>
     <div class="badge">🟢 Procesamiento en el dispositivo. Tu fotografía no se sube a ningún servidor.</div>
+    <details class="info"><summary>ℹ️ Estado del dispositivo</summary>
     <div v-if="caps" class="badge">{{ capsLine }}</div>
     <div class="badge">{{ modelLine }}</div>
     <div v-if="mode" class="badge">{{ mode }}</div>
+    </details>
     <div class="row seg" role="group" aria-label="Modo"><button :class="{ on: !mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(false)">📷 Una foto</button><button :class="{ on: mont }" :disabled="busy || pvBusy || mPvBusy" @click="setMont(true)">🎬 Montaje (varias fotos)</button></div>
     <div class="frame" :style="frameStyle">
       <canvas v-if="mPreviewing" ref="mpCv" class="pv" aria-label="Vista previa del montaje" />
@@ -543,55 +591,32 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       <canvas v-else-if="bitmap" ref="cv" :width="dimsFor(512).W" :height="dimsFor(512).H" aria-label="Encuadre de la fotografía" @pointerdown="down" @pointermove="move" @pointerup="up" @pointercancel="up" />
       <label v-else class="empty">📷<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
     </div>
+    <div v-if="!mont && dance && bitmap && musicName" class="row">
+      <button v-if="!previewing" :disabled="busy || pvBusy || analyzing" @click="startPreview">{{ pvBusy ? 'Preparando…' : '▶ Vista previa en vivo' }}</button>
+      <template v-else><button @click="pvToggle">{{ pvPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopPreview">✕ Cerrar vista previa</button></template>
+    </div>
+      <div v-if="mont && mPhotos.length && musicName" class="row">
+        <button v-if="!mPreviewing" :disabled="busy || mPvBusy || analyzing || mAdding" @click="startMontagePreview">{{ mPvBusy ? 'Preparando…' : '▶ Vista previa del montaje' }}</button>
+        <template v-else><button @click="mpvToggle">{{ mPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopMontagePreview">✕ Cerrar vista previa</button></template>
+      </div>
+    <div class="tabs" role="tablist" aria-label="Ajustes"><button v-for="t in TABS" :key="t.id" role="tab" :aria-selected="tab === t.id" :class="{ on: tab === t.id }" @click="tab = t.id">{{ t.label }}</button></div>
+    <section v-if="tab === 'foto'" class="panel">
     <div v-if="!mont" class="row">
       <label class="btn">Elegir fotografía<input type="file" accept="image/*,.heic" hidden @change="pick" /></label>
       <button v-if="photoUrl" @click="clear()">Quitar</button>
       <button v-if="videoUrl || previewing" @click="stopPreview(); clear(false)">Ajustar encuadre</button>
     </div>
     <div v-if="!mont && bitmap && !videoUrl" class="row"><input type="range" min="1" max="5" step="0.05" v-model.number="crop.zoom" aria-label="Zoom" /><button @click="rotateCrop(bitmap, crop, AR)">↻ Girar</button></div>
-    <div class="row seg" role="group" aria-label="Formato"><button v-for="f in FMTS" :key="f.id" :class="{ on: fmt === f.id }" :disabled="busy || pvBusy || mPvBusy" @click="setFmt(f.id)">{{ f.label }}</button></div>
-    <div v-if="!mont && dance && bitmap && musicName" class="row">
-      <button v-if="!previewing" :disabled="busy || pvBusy || analyzing" @click="startPreview">{{ pvBusy ? 'Preparando…' : '▶ Vista previa en vivo' }}</button>
-      <template v-else><button @click="pvToggle">{{ pvPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopPreview">✕ Cerrar vista previa</button></template>
-    </div>
-    <div v-if="mont" class="bgs">
+    <div v-if="mont" class="panel">
       <div class="row"><label class="btn">{{ mPhotos.length ? '➕ Añadir' : '📷 Fotos o vídeos' }}<input type="file" accept="image/*,.heic,video/*" multiple hidden :disabled="busy || mPvBusy || mAdding || mPhotos.length >= MAX_PHOTOS" @change="addPhotos" /></label><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="clearPhotos">Quitar todas</button><button v-if="videoUrl" @click="clear(false)">Volver a las fotos</button></div>
       <div class="row"><button v-if="mPhotos.length" :disabled="busy || mAdding" @click="saveProject">💾 Guardar proyecto</button><label class="btn">📂 Abrir proyecto<input type="file" :accept="EXT + ',application/zip'" hidden :disabled="busy || mPvBusy || mAdding" @change="openProject" /></label></div>
       <div v-if="mPhotos.length" class="mlist"><div v-for="(p, i) in mPhotos" :key="p.id" class="mrow"><img :src="p.url" :alt="p.name" /><span>{{ i + 1 }} · {{ p.kind === 'video' ? '🎞 vídeo' : p.faces.length ? p.faces.length + (p.faces.length === 1 ? ' persona' : ' personas') : 'sin rostro' }}</span><button :class="{ on: p.fav }" :disabled="busy" :aria-label="p.fav ? 'Quitar de favoritas' : 'Marcar favorita'" :title="p.fav ? 'Favorita: sale el doble de veces' : 'Marcar como favorita'" @click="toggleFav(p.id)">{{ p.fav ? '⭐' : '☆' }}</button><button :disabled="busy || i === 0" aria-label="Subir" @click="movePhoto(i, -1)">◀</button><button :disabled="busy || i === mPhotos.length - 1" aria-label="Bajar" @click="movePhoto(i, 1)">▶</button><button :disabled="busy" aria-label="Quitar" @click="removePhoto(p.id)">✕</button></div></div>
       <div class="row seg" role="group" aria-label="Estilo del montaje"><button v-for="s in STYLES" :key="s.id" :class="{ on: mStyle === s.id }" @click="mStyle = s.id">{{ s.label }}</button></div>
       <div class="st">{{ mHint }}</div>
       <label class="st"><input type="checkbox" v-model="reactOn" /> 🎛 Efectos que reaccionan a la música (destello con los graves, color según la canción, cortes en la percusión)</label>
-      <details v-if="mPhotos.length" class="fold"><summary>🔤 Títulos y texto al ritmo</summary>
-        <input v-model="titles.intro" maxlength="40" placeholder="Título de la intro (p. ej. Verano 2026)" />
-        <input v-model="titles.sub" maxlength="50" placeholder="Subtítulo (opcional)" />
-        <textarea v-model="phrasesText" rows="3" placeholder="Frases que entran palabra a palabra con el ritmo (una por línea)" />
-        <input v-model="titles.outro" maxlength="40" placeholder="Cierre (opcional, p. ej. @usuario)" />
-        <div class="row seg" role="group" aria-label="Tipo de letra"><button v-for="f in FONT_OPTS" :key="f.id" :class="{ on: titles.font === f.id }" @click="titles.font = f.id">{{ f.label }}</button></div>
-        <div class="row seg" role="group" aria-label="Posición"><button :class="{ on: titles.pos === 'top' }" @click="titles.pos = 'top'">Arriba</button><button :class="{ on: titles.pos === 'center' }" @click="titles.pos = 'center'">Centro</button><button :class="{ on: titles.pos === 'bottom' }" @click="titles.pos = 'bottom'">Abajo</button></div>
-        <div class="row"><label class="st">Texto <input type="color" v-model="titles.color" /></label><label class="st">Acento <input type="color" v-model="titles.accent" /></label></div>
-        <div class="st">La intro abre el vídeo, cada frase entra en un primer tiempo (y se clava en los drops) y el cierre cae al final.</div>
-      </details>
-      <details v-if="mPhotos.length" class="fold"><summary>✂️ Guion: transiciones, favoritas y planos</summary>
-        <div class="st">Transiciones permitidas (sin marcar = automático)</div>
-        <div class="chips"><button v-for="t in TRANS_OPTS" :key="t.id" :class="{ on: mTrans.includes(t.id) }" @click="toggleTrans(t.id)">{{ t.label }}</button></div>
-        <div class="st">⭐ Las fotos favoritas salen el doble de veces. Toca un plano para verlo en la vista previa; cambia su foto, encuadre o transición, o súbelo y bájalo.</div>
-        <button v-if="!mShots.length" :disabled="!musicName || analyzing" @click="showScript">Ver el guion</button>
-        <div v-else class="shots">
-          <div v-for="(s, k) in mShots" :key="k" class="shot" @click="seekShot(k)">
-            <span class="t">{{ fmtT(s.t0) }}</span>
-            <select :value="s.photo" @click.stop @change="setEdits({ [k]: { photo: +val($event) } })"><option v-for="(p, i) in mPhotos" :key="p.id" :value="i">Foto {{ i + 1 }}</option></select>
-            <select :value="planoKey(s)" @click.stop @change="onPlano(k, val($event))"><option v-for="o in planoOpts(s.photo)" :key="o.v" :value="o.v">{{ o.l }}</option></select>
-            <select v-if="k > 0" :value="s.trans" :disabled="s.finale" @click.stop @change="setEdits({ [k]: { trans: val($event) as Trans } })"><option v-for="t in TRANS_OPTS" :key="t.id" :value="t.id">{{ t.label }}</option></select>
-            <button :disabled="k === 0" aria-label="Subir plano" @click.stop="swapShots(k, -1)">▲</button><button :disabled="k === mShots.length - 1" aria-label="Bajar plano" @click.stop="swapShots(k, 1)">▼</button>
-          </div>
-          <button v-if="Object.keys(mEdits).length" @click="resetEdits">↺ Quitar mis cambios</button>
-        </div>
-      </details>
-      <div v-if="mPhotos.length && musicName" class="row">
-        <button v-if="!mPreviewing" :disabled="busy || mPvBusy || analyzing || mAdding" @click="startMontagePreview">{{ mPvBusy ? 'Preparando…' : '▶ Vista previa del montaje' }}</button>
-        <template v-else><button @click="mpvToggle">{{ mPlaying ? '⏸ Pausa' : '▶ Seguir' }}</button><button @click="stopMontagePreview">✕ Cerrar vista previa</button></template>
-      </div>
     </div>
+    </section>
+    <section v-if="tab === 'sonido'" class="panel">
     <div v-if="!mont" class="row seg"><button :class="{ on: dance }" @click="dance = true">💃 Bailar con música</button><button :class="{ on: !dance }" @click="dance = false">💬 Instrucción</button></div>
     <template v-if="!dance">
       <label>¿Qué quieres que haga?
@@ -600,16 +625,21 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
     </template>
     <template v-else>
       <div class="bgs"><div class="st">Música incluida</div>
-        <div class="chips"><button v-for="t in TRACKS" :key="t.id" :class="{ on: selTrack === t.id }" :disabled="busy || analyzing" @click="pickTrack(t)">{{ t.emoji }} {{ t.name }}</button></div></div>
-      <div class="row"><label class="btn">{{ musicName && !selTrack ? '🎵 Cambiar la mía' : '🎵 Subir la mía' }}<input type="file" accept="audio/*,audio/mpeg,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
+        <div class="tracks"><div v-for="t in TRACKS" :key="t.id" class="trk"><button :class="{ on: selTrack === t.id }" :disabled="busy || analyzing" @click="pickTrack(t)">{{ t.emoji }} {{ t.name }} · {{ t.bpm }} BPM</button><button class="pl" :aria-label="'Escuchar ' + t.name" :title="'Escuchar ' + t.name" @click="listen(trackUrl(t), t.name)">{{ preOn && preUrl === trackUrl(t) ? '⏸' : '▶' }}</button></div></div></div>
+      <div class="row"><label class="btn">🎵 Subir música<input type="file" accept="audio/*,audio/mpeg,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" hidden :disabled="busy || analyzing" @change="pickMusic" /></label><button v-if="musicName" :disabled="busy" @click="clearMusic">Quitar</button></div>
+      <div v-if="myMusic.length" class="bgs"><div class="st">Mi música · {{ myMusic.length }} · {{ myMb }} MB (se guarda en este dispositivo)</div>
+        <div class="tracks"><div v-for="m in myMusic" :key="m.id" class="trk"><button :class="{ on: selTrack === m.id }" :disabled="busy || analyzing" @click="pickMine(m)">🎵 {{ m.name }}</button><button class="pl" :aria-label="'Escuchar ' + m.name" @click="listen(mineUrl(m), m.name)">{{ preOn && preUrl === mineUrl(m) ? '⏸' : '▶' }}</button><button class="pl" :aria-label="'Quitar ' + m.name" :disabled="busy" @click="removeMine(m)">🗑</button></div></div></div>
+      <div v-if="preUrl" class="player"><div class="st">🎧 Preescucha: {{ preName }}</div><audio ref="preAudio" :src="preUrl" controls preload="none" @play="preOn = true" @pause="preOn = false" @ended="preOn = false" /></div>
       <div v-if="musicName" class="music">
         <div class="st">🎵 {{ musicName }} · {{ musicDur.toFixed(0) }} s</div>
         <div class="row bpmrow"><button @click="setBpm(bpm / 2)">÷2</button><button @click="setBpm(bpm - 1)">−</button><b>{{ bpm }} BPM</b><button @click="setBpm(bpm + 1)">+</button><button @click="setBpm(bpm * 2)">×2</button></div>
         <div v-if="structText" class="st">{{ structText }}</div>
-        <div v-if="bars" class="row"><button v-if="!bars.known || barShift" @click="barShift = (barShift + 1) % 4">🥁 Mover el 1</button><button v-if="maxStart > 0.5" @click="bestMoment">🎯 Mejor momento</button></div>
+        <div v-if="bars" class="row"><button v-if="!bars.known || barShift" @click="barShift = (barShift + 1) % 4">🥁 Mover el 1</button><button v-if="maxStart > 0.5" @click="bestMoment">🎯 Mejor momento</button><button @click="listen(musicUrl, musicName, startAt)">🎧 Escuchar desde aquí</button></div>
         <label v-if="maxStart > 0.5">Empezar en el segundo {{ startAt.toFixed(0) }} · baila {{ danceDur.toFixed(0) }} s<input type="range" min="0" :max="maxStart" step="0.5" v-model.number="startAt" style="width:100%" /></label>
       </div>
     </template>
+    </section>
+    <section v-if="tab === 'baile'" class="panel">
     <div v-if="dance" class="bgs">
       <div class="st">🎬 Imitar un vídeo (plantilla de movimientos)</div>
       <div v-if="mont" class="st">En el montaje la plantilla mueve cabeza y torso de cada persona (los brazos solo funcionan con una foto).</div>
@@ -632,6 +662,8 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
         <div class="row"><button v-if="refFile" :disabled="busy || analyzing" @click="useRefAudio">🎵 Usar su audio</button><button @click="saveTpl">💾 Guardar plantilla</button><button @click="clearTpl">Quitar</button></div>
       </template>
     </div>
+    </section>
+    <section v-if="tab === 'fondo'" class="panel">
     <div class="bgs"><div class="st">Fondo del vídeo</div>
       <div class="chips">
         <button :class="{ on: bgId === 'none' }" @click="bgId = 'none'">Original</button>
@@ -640,9 +672,46 @@ const share = () => navigator.share({ files: [new File([out.value!.blob], fname(
       </div>
       <label v-if="bgId !== 'none'" class="st"><input type="checkbox" v-model="integrate" /> ✨ Luz y sombra del fondo sobre la persona</label>
     </div>
-    <select v-model="tier"><option v-for="(t, k) in tiers" :key="k" :value="k">{{ tierLabel(k) }}</option></select>
+    </section>
+    <section v-if="tab === 'formato'" class="panel">
+    <div class="row seg" role="group" aria-label="Formato"><button v-for="f in FMTS" :key="f.id" :class="{ on: fmt === f.id }" :disabled="busy || pvBusy || mPvBusy" @click="setFmt(f.id)">{{ f.label }}</button></div>
+    <label class="st">⏱ Duración: {{ durLabel(durSel) }}<input type="range" :min="DUR_MIN" :max="DUR_MAX" step="1" v-model.number="durSel" :disabled="busy" style="width:100%" /></label>
+      <div v-if="dance && musicName && durSel > musicDur" class="st">La canción dura {{ musicDur.toFixed(0) }} s: el vídeo será de {{ danceDur.toFixed(0) }} s.</div>
+      <div class="st">{{ sizeHint }}</div>
+      <select v-model="tier"><option v-for="(t, k) in tiers" :key="k" :value="k">{{ tierLabel(k) }}</option></select>
       <div class="row seg" role="group" aria-label="Formato de salida"><button v-for="o in ['mp4', 'webm', 'gif']" :key="o" :class="{ on: outFmt === o }" :disabled="busy" @click="outFmt = o as typeof outFmt">{{ o.toUpperCase() }}</button></div>
       <div v-if="outFmt === 'gif'" class="st">GIF: sin sonido, hasta {{ GIF_MAX_S }} s, {{ GIF_LONG }} px y {{ GIF_FPS }} fps. WebM: para compartir en web.</div>
+    </section>
+    <section v-if="mont && tab === 'texto'" class="panel"><div v-if="!mPhotos.length" class="st">Añade primero las fotos.</div>
+      <div class="fold"><b>🔤 Títulos y texto al ritmo</b>
+        <input v-model="titles.intro" maxlength="40" placeholder="Título de la intro (p. ej. Verano 2026)" />
+        <input v-model="titles.sub" maxlength="50" placeholder="Subtítulo (opcional)" />
+        <textarea v-model="phrasesText" rows="3" placeholder="Frases que entran palabra a palabra con el ritmo (una por línea)" />
+        <input v-model="titles.outro" maxlength="40" placeholder="Cierre (opcional, p. ej. @usuario)" />
+        <div class="row seg" role="group" aria-label="Tipo de letra"><button v-for="f in FONT_OPTS" :key="f.id" :class="{ on: titles.font === f.id }" @click="titles.font = f.id">{{ f.label }}</button></div>
+        <div class="row seg" role="group" aria-label="Posición"><button :class="{ on: titles.pos === 'top' }" @click="titles.pos = 'top'">Arriba</button><button :class="{ on: titles.pos === 'center' }" @click="titles.pos = 'center'">Centro</button><button :class="{ on: titles.pos === 'bottom' }" @click="titles.pos = 'bottom'">Abajo</button></div>
+        <div class="row"><label class="st">Texto <input type="color" v-model="titles.color" /></label><label class="st">Acento <input type="color" v-model="titles.accent" /></label></div>
+        <div class="st">La intro abre el vídeo, cada frase entra en un primer tiempo (y se clava en los drops) y el cierre cae al final.</div>
+      </div>
+    </section>
+    <section v-if="mont && tab === 'guion'" class="panel"><div v-if="!mPhotos.length" class="st">Añade primero las fotos.</div>
+      <div class="fold"><b>✂️ Guion: transiciones, favoritas y planos</b>
+        <div class="st">Transiciones permitidas (sin marcar = automático)</div>
+        <div class="chips"><button v-for="t in TRANS_OPTS" :key="t.id" :class="{ on: mTrans.includes(t.id) }" @click="toggleTrans(t.id)">{{ t.label }}</button></div>
+        <div class="st">⭐ Las fotos favoritas salen el doble de veces. Toca un plano para verlo en la vista previa; cambia su foto, encuadre o transición, o súbelo y bájalo.</div>
+        <button v-if="!mShots.length" :disabled="!musicName || analyzing" @click="showScript">Ver el guion</button>
+        <div v-else class="shots">
+          <div v-for="(s, k) in mShots" :key="k" class="shot" @click="seekShot(k)">
+            <span class="t">{{ fmtT(s.t0) }}</span>
+            <select :value="s.photo" @click.stop @change="setEdits({ [k]: { photo: +val($event) } })"><option v-for="(p, i) in mPhotos" :key="p.id" :value="i">Foto {{ i + 1 }}</option></select>
+            <select :value="planoKey(s)" @click.stop @change="onPlano(k, val($event))"><option v-for="o in planoOpts(s.photo)" :key="o.v" :value="o.v">{{ o.l }}</option></select>
+            <select v-if="k > 0" :value="s.trans" :disabled="s.finale" @click.stop @change="setEdits({ [k]: { trans: val($event) as Trans } })"><option v-for="t in TRANS_OPTS" :key="t.id" :value="t.id">{{ t.label }}</option></select>
+            <button :disabled="k === 0" aria-label="Subir plano" @click.stop="swapShots(k, -1)">▲</button><button :disabled="k === mShots.length - 1" aria-label="Bajar plano" @click.stop="swapShots(k, 1)">▼</button>
+          </div>
+          <button v-if="Object.keys(mEdits).length" @click="resetEdits">↺ Quitar mis cambios</button>
+        </div>
+      </div>
+    </section>
     <button v-if="mont" class="go" :disabled="!mPhotos.length || busy || analyzing || mAdding || !!(caps && !caps.ok)" @click="generateMontage">{{ busy ? 'Montando…' : '🎬 Crear montaje' }}</button>
     <button v-else class="go" :disabled="!bitmap || busy || analyzing || !!(caps && !caps.ok)" @click="generate">{{ busy ? 'Animando…' : 'Animar' }}</button>
     <div v-if="busy" class="bar"><i :style="{ width: pct + '%' }" /></div>
